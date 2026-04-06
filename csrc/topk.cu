@@ -33,7 +33,17 @@ void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  if (num_rows > 32) {
+  static int num_sms = 0;
+  static int max_smem_per_block = 0;
+  if (num_sms == 0) {
+    int device;
+    cudaGetDevice(&device);
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
+    cudaDeviceGetAttribute(&max_smem_per_block,
+                           cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+  }
+
+  if (num_rows > 32 && max_smem_per_block >= 128 * 1024) {
     cudaError_t status = vllm::FilteredTopKRaggedTransform<float, int32_t>(
         logits.data_ptr<float>(), output.data_ptr<int32_t>(),
         lengths.data_ptr<int32_t>(), static_cast<uint32_t>(num_rows),
@@ -43,16 +53,6 @@ void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
   } else {
     TORCH_CHECK(workspace.is_cuda(), "workspace must be CUDA tensor");
     TORCH_CHECK(workspace.dtype() == torch::kUInt8, "workspace must be uint8");
-
-    static int num_sms = 0;
-    static int max_smem_per_block = 0;
-    if (num_sms == 0) {
-      int device;
-      cudaGetDevice(&device);
-      cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
-      cudaDeviceGetAttribute(&max_smem_per_block,
-                             cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    }
 
     // Smem cap: smaller smem → more CTAs/group → more per-row parallelism for
     // large path. Empirically tuned.
