@@ -209,7 +209,8 @@ def sparse_attn_indexer(
                 + decode_metadata.offsets
             ).flatten()
 
-        if current_platform.is_cuda():
+        # Hopper+ path
+        if current_platform.is_cuda() and current_platform.has_device_capability(90):
             workspace_manager = current_workspace_manager()
             (topk_workspace,) = workspace_manager.get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
