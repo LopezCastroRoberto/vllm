@@ -13,6 +13,7 @@
 void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
                      torch::Tensor& output, torch::Tensor& workspace, int64_t k,
                      int64_t max_seq_len) {
+#ifndef USE_ROCM
   TORCH_CHECK(logits.is_cuda(), "logits must be CUDA tensor");
   TORCH_CHECK(lengths.is_cuda(), "lengths must be CUDA tensor");
   TORCH_CHECK(output.is_cuda(), "output must be CUDA tensor");
@@ -29,7 +30,6 @@ void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
   TORCH_CHECK(lengths.size(0) == num_rows, "lengths size mismatch");
   TORCH_CHECK(output.size(0) == num_rows && output.size(1) == k,
               "output size mismatch");
-#ifndef USE_ROCM
   namespace P = vllm::persistent;
 
   TORCH_CHECK(k == P::TopK, "k must be 2048");
