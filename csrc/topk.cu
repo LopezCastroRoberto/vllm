@@ -5,7 +5,10 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <algorithm>
+
+#ifndef USE_ROCM
 #include "persistent_topk.cuh"
+#endif
 
 void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
                      torch::Tensor& output, torch::Tensor& workspace, int64_t k,
@@ -26,6 +29,7 @@ void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
   TORCH_CHECK(lengths.size(0) == num_rows, "lengths size mismatch");
   TORCH_CHECK(output.size(0) == num_rows && output.size(1) == k,
               "output size mismatch");
+#ifndef USE_ROCM
   namespace P = vllm::persistent;
 
   TORCH_CHECK(k == P::TopK, "k must be 2048");
@@ -144,4 +148,7 @@ void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
   cudaError_t err = cudaGetLastError();
   TORCH_CHECK(err == cudaSuccess,
               "persistent_topk failed: ", cudaGetErrorString(err));
+#else
+  TORCH_CHECK(false, "persistent_topk is not supported on ROCm");
+#endif
 }
