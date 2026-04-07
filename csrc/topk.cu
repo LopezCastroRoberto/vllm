@@ -7,7 +7,7 @@
 #include <algorithm>
 
 #ifndef USE_ROCM
-#include "persistent_topk.cuh"
+  #include "persistent_topk.cuh"
 #endif
 
 void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
@@ -125,15 +125,15 @@ void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
     params.ctas_per_group = ctas_per_group;
     params.max_seq_len = static_cast<uint32_t>(max_seq_len);
 
-#define LAUNCH_PERSISTENT(VS)                                               \
-  do {                                                                      \
-    auto kernel = &P::persistent_topk_kernel<VS>;                           \
-    cudaError_t err = cudaFuncSetAttribute(                                 \
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);    \
-    TORCH_CHECK(err == cudaSuccess,                                         \
-                "Failed to set smem: ", cudaGetErrorString(err));           \
-    kernel<<<total_ctas, P::kThreadsPerBlock, smem_size, stream>>>(params); \
-  } while (0)
+  #define LAUNCH_PERSISTENT(VS)                                               \
+    do {                                                                      \
+      auto kernel = &P::persistent_topk_kernel<VS>;                           \
+      cudaError_t err = cudaFuncSetAttribute(                                 \
+          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);    \
+      TORCH_CHECK(err == cudaSuccess,                                         \
+                  "Failed to set smem: ", cudaGetErrorString(err));           \
+      kernel<<<total_ctas, P::kThreadsPerBlock, smem_size, stream>>>(params); \
+    } while (0)
 
     if (vec_size == 4) {
       LAUNCH_PERSISTENT(4);
@@ -142,7 +142,7 @@ void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
     } else {
       LAUNCH_PERSISTENT(1);
     }
-#undef LAUNCH_PERSISTENT
+  #undef LAUNCH_PERSISTENT
   }
 
   cudaError_t err = cudaGetLastError();
