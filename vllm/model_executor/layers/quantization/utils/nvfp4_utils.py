@@ -31,6 +31,7 @@ class NvFp4LinearBackend(Enum):
     FLASHINFER_CUTLASS = "flashinfer-cutlass"
     FLASHINFER_TRTLLM = "flashinfer-trtllm"
     FLASHINFER_CUDNN = "flashinfer-cudnn"
+    FLASHINFER_CUTE_DSL = "flashinfer-cute-dsl"
     FBGEMM = "fbgemm"
     MARLIN = "marlin"
     EMULATION = "emulation"
@@ -70,6 +71,7 @@ def select_nvfp4_linear_backend() -> NvFp4LinearBackend:
         NvFp4LinearBackend.FLASHINFER_CUTLASS,
         NvFp4LinearBackend.FLASHINFER_TRTLLM,
         NvFp4LinearBackend.FLASHINFER_CUDNN,
+        NvFp4LinearBackend.FLASHINFER_CUTE_DSL,
     ):
         assert has_flashinfer(), f"FlashInfer is required for {backend}"
     elif backend == NvFp4LinearBackend.VLLM_CUTLASS:
@@ -158,6 +160,7 @@ def convert_to_nvfp4_linear_kernel_format(
         NvFp4LinearBackend.VLLM_CUTLASS,
         NvFp4LinearBackend.FLASHINFER_CUTLASS,
         NvFp4LinearBackend.FLASHINFER_CUDNN,
+        NvFp4LinearBackend.FLASHINFER_CUTE_DSL,
     ):
         weight, weight_scale, weights_padding_cols = prepare_weights_for_nvfp4_cutlass(
             layer.weight.data, layer.weight_scale.data

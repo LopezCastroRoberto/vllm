@@ -568,21 +568,25 @@ def flashinfer_scaled_fp4_mm(
     assert a.stride(-1) == 1 and b.stride(-1) == 1
     assert a.shape[1] == b.shape[1]
 
-    if backend in ("cutlass", "cudnn"):
+    if backend in ("cutlass", "cudnn", "cute-dsl"):
         block_scale_a = block_scale_a.view(torch.uint8)
         block_scale_b = block_scale_b.view(torch.uint8)
 
     use_8x4_sf_layout = True if backend == "trtllm" and a.shape[0] <= 32 else False  # noqa: SIM210
 
-    return flashinfer_mm_fp4(
+    from flashinfer import mm_fp4 as _flashinfer_mm_fp4
+
+    return _flashinfer_mm_fp4(
         a,
         b.t(),
         block_scale_a,
         block_scale_b.t(),
         alpha,
         out_dtype,
+        block_size=16,
         use_8x4_sf_layout=use_8x4_sf_layout,
         backend=backend,
+        use_nvfp4=True,
     )
 
 
