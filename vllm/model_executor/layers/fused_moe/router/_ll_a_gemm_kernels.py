@@ -410,8 +410,6 @@ class LLAGemm:
 
         k_tile_count = cute.size(gA, mode=[2])
 
-        cute.arch.griddepcontrol_wait()
-
         if is_dma:
             cute.arch.setmaxregister_decrease(40)
 
@@ -460,8 +458,27 @@ class LLAGemm:
             producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, num_stages
             )
+            
+            mainloop_pipeline.producer_acquire(producer_state)
+            cute.copy(
+                tiled_copy_B,
+                tBgB[None, None, None, 0],
+                tBsB[None, None, None, producer_state.index],
+                pred=tBpB,
+            )
 
-            for k_tile in range(k_tile_count):
+            cute.arch.griddepcontrol_wait()
+
+            cute.copy(
+                tiled_copy_A,
+                tAgA[None, None, None, 0],
+                tAsA[None, None, None, producer_state.index],
+                pred=tApA,
+            )
+            mainloop_pipeline.producer_commit(producer_state)
+            producer_state.advance()
+
+            for k_tile in range(1, k_tile_count):
                 mainloop_pipeline.producer_acquire(producer_state)
                 cute.copy(
                     tiled_copy_A,
@@ -482,6 +499,7 @@ class LLAGemm:
 
         else:
             # ===== 4 MMA WARPS with k-phase interleaving =====
+            cute.arch.griddepcontrol_wait()
             cute.arch.setmaxregister_increase(232)
 
             lane_id = mma_tidx % 32

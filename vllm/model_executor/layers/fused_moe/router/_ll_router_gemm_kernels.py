@@ -92,22 +92,38 @@ def dotprod_bf16(
     for m in cutlass.range_constexpr(M):
         acc[m] = cutlass.Float32(0.0)
 
-    cute.arch.griddepcontrol_wait()
+    if k_main > 0:
+        kb0 = tidx * VPT
+        bp0 = (gB.iterator + (n_idx * K_dim + kb0)).align(32)
+        bt0 = cute.make_tensor(bp0, cute.make_layout((VPT,)))
+        br0 = cute.make_rmem_tensor((VPT,), elem)
+        cute.autovec_copy(bt0, br0)
 
-    # Main loop: 256-bit loads (16 bf16 = 32 bytes)
-    for ki in cutlass.range(k_main, unroll=4):
-        kb = ki * KPI + tidx * VPT
-        bp = (gB.iterator + (n_idx * K_dim + kb)).align(32)
-        bt = cute.make_tensor(bp, cute.make_layout((VPT,)))
-        br = cute.make_rmem_tensor((VPT,), elem)
-        cute.autovec_copy(bt, br)
+        cute.arch.griddepcontrol_wait()
+        
         for m in cutlass.range_constexpr(M):
-            ap = (gA.iterator + (m * K_dim + kb)).align(32)
-            at = cute.make_tensor(ap, cute.make_layout((VPT,)))
-            ar = cute.make_rmem_tensor((VPT,), elem)
-            cute.autovec_copy(at, ar)
+            ap0 = (gA.iterator + (m * K_dim + kb0)).align(32)
+            at0 = cute.make_tensor(ap0, cute.make_layout((VPT,)))
+            ar0 = cute.make_rmem_tensor((VPT,), elem)
+            cute.autovec_copy(at0, ar0)
             for v in cutlass.range_constexpr(VPT):
-                acc[m] = acc[m] + ar[v].to(cutlass.Float32) * br[v].to(cutlass.Float32)
+                acc[m] = acc[m] + ar0[v].to(cutlass.Float32) * br0[v].to(cutlass.Float32)
+
+        for ki in cutlass.range(k_main - 1, unroll=4):
+            kb = (ki + 1) * KPI + tidx * VPT
+            bp = (gB.iterator + (n_idx * K_dim + kb)).align(32)
+            bt = cute.make_tensor(bp, cute.make_layout((VPT,)))
+            br = cute.make_rmem_tensor((VPT,), elem)
+            cute.autovec_copy(bt, br)
+            for m in cutlass.range_constexpr(M):
+                ap = (gA.iterator + (m * K_dim + kb)).align(32)
+                at = cute.make_tensor(ap, cute.make_layout((VPT,)))
+                ar = cute.make_rmem_tensor((VPT,), elem)
+                cute.autovec_copy(at, ar)
+                for v in cutlass.range_constexpr(VPT):
+                    acc[m] = acc[m] + ar[v].to(cutlass.Float32) * br[v].to(cutlass.Float32)
+    else:
+        cute.arch.griddepcontrol_wait()
 
     # Tail: 128-bit loads
     for ti in cutlass.range(k_tail):
@@ -212,26 +228,46 @@ def dotprod_fp8(
     for m in cutlass.range_constexpr(M):
         acc[m] = cutlass.Float32(0.0)
 
-    cute.arch.griddepcontrol_wait()
+    if k_main > 0:
+        kb0 = tidx * VPT
+        bp0 = (gB.iterator + (n_idx * K_pairs + kb0)).align(16)
+        bt0 = cute.make_tensor(bp0, cute.make_layout((VPT,)))
+        br0 = cute.make_rmem_tensor((VPT,), cutlass.Int16)
+        cute.autovec_copy(bt0, br0)
 
-    # Main loop: 128-bit loads (8 Int16 = 16 bytes = 16 fp8)
-    for ki in cutlass.range(k_main, unroll=4):
-        kb = ki * KPI + tidx * VPT
-        bp = (gB.iterator + (n_idx * K_pairs + kb)).align(16)
-        bt = cute.make_tensor(bp, cute.make_layout((VPT,)))
-        br = cute.make_rmem_tensor((VPT,), cutlass.Int16)
-        cute.autovec_copy(bt, br)
-        bf = cute.make_rmem_tensor((F_PER_T,), cutlass.Float32)
+        cute.arch.griddepcontrol_wait()
+        
+        bf0 = cute.make_rmem_tensor((F_PER_T,), cutlass.Float32)
         for p in cutlass.range_constexpr(VPT):
-            bf[p * 2], bf[p * 2 + 1] = fp8x2_cvt(br[p])
+            bf0[p * 2], bf0[p * 2 + 1] = fp8x2_cvt(br0[p])
         for m in cutlass.range_constexpr(M):
-            ap = (gA.iterator + (m * K_pairs + kb)).align(16)
-            at = cute.make_tensor(ap, cute.make_layout((VPT,)))
-            ar = cute.make_rmem_tensor((VPT,), cutlass.Int16)
-            cute.autovec_copy(at, ar)
+            ap0 = (gA.iterator + (m * K_pairs + kb0)).align(16)
+            at0 = cute.make_tensor(ap0, cute.make_layout((VPT,)))
+            ar0 = cute.make_rmem_tensor((VPT,), cutlass.Int16)
+            cute.autovec_copy(at0, ar0)
             for p in cutlass.range_constexpr(VPT):
-                a0, a1 = fp8x2_cvt(ar[p])
-                acc[m] = acc[m] + a0 * bf[p * 2] + a1 * bf[p * 2 + 1]
+                a00, a10 = fp8x2_cvt(ar0[p])
+                acc[m] = acc[m] + a00 * bf0[p * 2] + a10 * bf0[p * 2 + 1]
+        
+        for ki in cutlass.range(k_main - 1, unroll=4):
+            kb = (ki + 1) * KPI + tidx * VPT
+            bp = (gB.iterator + (n_idx * K_pairs + kb)).align(16)
+            bt = cute.make_tensor(bp, cute.make_layout((VPT,)))
+            br = cute.make_rmem_tensor((VPT,), cutlass.Int16)
+            cute.autovec_copy(bt, br)
+            bf = cute.make_rmem_tensor((F_PER_T,), cutlass.Float32)
+            for p in cutlass.range_constexpr(VPT):
+                bf[p * 2], bf[p * 2 + 1] = fp8x2_cvt(br[p])
+            for m in cutlass.range_constexpr(M):
+                ap = (gA.iterator + (m * K_pairs + kb)).align(16)
+                at = cute.make_tensor(ap, cute.make_layout((VPT,)))
+                ar = cute.make_rmem_tensor((VPT,), cutlass.Int16)
+                cute.autovec_copy(at, ar)
+                for p in cutlass.range_constexpr(VPT):
+                    a0, a1 = fp8x2_cvt(ar[p])
+                    acc[m] = acc[m] + a0 * bf[p * 2] + a1 * bf[p * 2 + 1]
+    else:
+        cute.arch.griddepcontrol_wait()
 
     # Tail: 64-bit loads
     for ti in cutlass.range(k_tail):
