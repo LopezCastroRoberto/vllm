@@ -53,14 +53,18 @@ def _get_compiled(M: int, is_fp8: bool, K: int, N: int, a_flat, b_flat, c_flat):
 
     host_fn = host_fp8 if is_fp8 else host_bf16
 
-    a_c = from_dlpack(a_flat, assumed_align=32).mark_layout_dynamic()
-    b_c = from_dlpack(b_flat, assumed_align=32).mark_layout_dynamic()
-    c_c = from_dlpack(c_flat, assumed_align=32).mark_layout_dynamic()
+    a_c = from_dlpack(a_flat, assumed_align=32,
+                      enable_tvm_ffi=True).mark_layout_dynamic()
+    b_c = from_dlpack(b_flat, assumed_align=32,
+                      enable_tvm_ffi=True).mark_layout_dynamic()
+    c_c = from_dlpack(c_flat, assumed_align=32,
+                      enable_tvm_ffi=True).mark_layout_dynamic()
 
     K_eff = K // 2 if is_fp8 else K
     stream = CUstream(current_stream().cuda_stream)
 
-    compiled = cute.compile(host_fn, a_c, b_c, c_c, M, K_eff, N, stream)
+    compiled = cute.compile(host_fn, a_c, b_c, c_c, M, K_eff, N, stream,
+                            options="--enable-tvm-ffi")
     _compiled_cache[key] = compiled
     logger.debug("Compiled ll_router_gemm: M=%d, is_fp8=%s", M, is_fp8)
     return compiled
@@ -82,7 +86,6 @@ def ll_router_gemm(
         [M, N] output tensor.
     """
     from cuda.bindings.driver import CUstream
-    from cutlass.cute.runtime import from_dlpack
     from torch.cuda import current_stream
 
     M, K = hidden_states.shape
@@ -101,12 +104,9 @@ def ll_router_gemm(
 
     compiled = _get_compiled(M, is_fp8, K, N, a_flat, b_flat, c_flat)
 
-    a_c = from_dlpack(a_flat, assumed_align=32).mark_layout_dynamic()
-    b_c = from_dlpack(b_flat, assumed_align=32).mark_layout_dynamic()
-    c_c = from_dlpack(c_flat, assumed_align=32).mark_layout_dynamic()
-
+    # TVM FFI: pass torch tensors directly (no from_dlpack on hot path)
     K_eff = K // 2 if is_fp8 else K
     stream = CUstream(current_stream().cuda_stream)
-    compiled(a_c, b_c, c_c, K_eff, N, stream)
+    compiled(a_flat, b_flat, c_flat, K_eff, N, stream)
 
     return output
