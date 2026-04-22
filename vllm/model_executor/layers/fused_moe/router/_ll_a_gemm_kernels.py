@@ -227,7 +227,7 @@ class LLAGemm:
         self.out_dtype = out_dtype
         self.tile_m = 16
         # min tile_n = 1*8*2 = 16
-        self.tile_n = max(tile_n, 16)
+        self.tile_n = tile_n
         self.tile_k = tile_k
         self.num_stages = num_stages
         self.is_fp8 = is_fp8
@@ -307,7 +307,7 @@ class LLAGemm:
         op = cute.nvgpu.warp.MmaF16BF16Op(self.ab_dtype, self.acc_dtype, self.mma_shape)
         perm_mnk = (
             self.atom_layout[0] * self.mma_shape[0],
-            self.atom_layout[1] * self.mma_shape[1] * 2,
+            self.atom_layout[1] * self.mma_shape[1] * (self.tile_n // 8),
             self.atom_layout[2] * self.mma_shape[2],
         )
         tiled_mma = cute.make_tiled_mma(
