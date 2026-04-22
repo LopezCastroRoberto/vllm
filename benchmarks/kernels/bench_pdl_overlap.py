@@ -1,11 +1,16 @@
 import torch
 from cutlass._mlir.dialects import llvm as _llvm
 from cutlass.cutlass_dsl import dsl_user_op
-import cutlass, cutlass.cute as cute
+import cutlass
+import cutlass.cute as cute
 from cuda.bindings.driver import CUstream
 from cutlass.cute.runtime import from_dlpack
 from torch.cuda import current_stream
+
+from vllm.model_executor.layers.fused_moe.router.ll_a_gemm import ll_a_gemm
+from vllm.model_executor.layers.fused_moe.router.ll_a_gemm_tma import ll_a_gemm_tma
 from vllm.model_executor.layers.fused_moe.router.ll_router_gemm import ll_router_gemm
+
 
 @dsl_user_op
 def nanosleep(ns, *, loc=None, ip=None):
@@ -35,7 +40,6 @@ def bench_cg_n1(fn, n_retries=100):
         with torch.cuda.graph(g):
             fn()
         torch.cuda.synchronize()
-        # warmup replays
         for _ in range(10):
             g.replay()
         torch.cuda.synchronize()
@@ -49,44 +53,109 @@ def bench_cg_n1(fn, n_retries=100):
             torch.cuda.synchronize()
             ret.append(s.elapsed_time(e) * 1000)
         ret.sort()
-        return ret[len(ret)//2]
+        return ret[len(ret) // 2]
 
-N, K = 256, 7168
+
+# Producer
 buf = torch.empty(1, dtype=torch.float32, device="cuda")
 bc = from_dlpack(buf, assumed_align=16).mark_layout_dynamic()
-sfn = lambda: CUstream(current_stream().cuda_stream)
-comp_p = cute.compile(host_producer, bc, 0, sfn())
+comp_p = cute.compile(host_producer, bc, 0,
+                      CUstream(current_stream().cuda_stream))
 
 print("Device:", torch.cuda.get_device_name())
 print("Producer: 1 block, 128 threads | n_repeat=1, n_retries=100")
 print()
 
-for M in [1, 4, 16]:
+SHAPES = [
+    (7168, 256,   "router gate",      "router"),
+    (7168, 2112,  "a_proj combined",   "a_gemm"),
+    (7168, 576,   "kv_a_proj",         "a_gemm"),
+    (7168, 1536,  "q_a_proj",          "a_gemm"),
+    (1536, 3072,  "q_b_proj TP8",      "a_gemm"),
+    (512,  4096,  "kv_b_proj TP8",     "a_gemm"),
+]
+
+TAILS = [0, 2000, 5000, 10000, 20000, 50000]
+M = 16
+
+# Producer solo times
+prod_times = {}
+for tns in TAILS:
+    def sp(_t=tns):
+        comp_p(bc, _t, CUstream(current_stream().cuda_stream))
+    prod_times[tns] = bench_cg_n1(sp)
+
+for K, N, label, ktype in SHAPES:
+    print("=" * 95)
+    print("M=%d K=%d N=%d — %s" % (M, K, N, label))
+
     a = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     b = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
-    ll_router_gemm(a, b); torch.cuda.synchronize()
-    c_us = bench_cg_n1(lambda: ll_router_gemm(a, b))
 
-    print("M=%d, GEMM solo: %.2fus" % (M, c_us))
-    print("%10s | %10s %10s %11s %10s" % (
-        "tail_ns", "producer", "pair", "sequential", "overlap"))
-    print("-" * 55)
+    a8 = a.to(torch.float8_e4m3fn).view(torch.bfloat16)
+    b8 = b.to(torch.float8_e4m3fn).view(torch.bfloat16)
 
-    for tns in [0, 2000, 5000, 10000, 20000, 50000]:
-        def solo_p(_t=tns):
-            comp_p(bc, _t, CUstream(current_stream().cuda_stream))
-        p_us = bench_cg_n1(solo_p)
+    kernels = {}
 
-        def make_pair(t, aa, bb):
-            def fn():
-                comp_p(bc, t, CUstream(current_stream().cuda_stream))
-                ll_router_gemm(aa, bb)
-            return fn
-        pair_us = bench_cg_n1(make_pair(tns, a, b))
+    if ktype == "router":
+        ll_router_gemm(a, b); torch.cuda.synchronize()
+        kernels['p-bf16'] = lambda: ll_router_gemm(a, b)
+    else:
+        ll_a_gemm(a, b); torch.cuda.synchronize()
+        kernels['p-bf16'] = lambda: ll_a_gemm(a, b)
 
-        seq = p_us + c_us
-        ovlp = seq - pair_us
-        pct = ovlp / seq * 100 if seq > 0 else 0
-        print("%8dns | %9.2fus %9.2fus %10.2fus %8.2fus (%4.1f%%)" % (
-            tns, p_us, pair_us, seq, ovlp, pct))
+        ll_a_gemm(a8, b8, is_fp8=True); torch.cuda.synchronize()
+        kernels['p-fp8'] = lambda: ll_a_gemm(a8, b8, is_fp8=True)
+
+        try:
+            ll_a_gemm_tma(a, b); torch.cuda.synchronize()
+            kernels['t-bf16'] = lambda: ll_a_gemm_tma(a, b)
+        except Exception as e:
+            print("  TMA bf16 error: %s" % str(e)[:60])
+
+        try:
+            ll_a_gemm_tma(a8, b8, is_fp8=True); torch.cuda.synchronize()
+            kernels['t-fp8'] = lambda: ll_a_gemm_tma(a8, b8, is_fp8=True)
+        except Exception as e:
+            print("  TMA fp8 error: %s" % str(e)[:60])
+
+    # Solo times
+    solos = {k: bench_cg_n1(fn) for k, fn in kernels.items()}
+    solo_str = "  ".join("%s=%.2fus" % (k, v) for k, v in solos.items())
+    print("  Solo: %s" % solo_str)
+    print()
+
+    # Header
+    kcols = list(kernels.keys())
+    hdr = "%8s | %5s |" % ("tail", "prod")
+    for k in kcols:
+        hdr += " %8s %5s |" % (k, "ovlp")
+    hdr += " bf16-best fp8-best"
+    print(hdr)
+    print("-" * len(hdr))
+
+    for tns in TAILS:
+        pr = prod_times[tns]
+        pairs = {}
+        ovlps = {}
+
+        for k, fn in kernels.items():
+            def pair_fn(_t=tns, _fn=fn):
+                comp_p(bc, _t, CUstream(current_stream().cuda_stream))
+                _fn()
+            pairs[k] = bench_cg_n1(pair_fn)
+            ovlps[k] = pr + solos[k] - pairs[k]
+
+        # Winners by dtype
+        bf16_keys = [k for k in kcols if 'bf16' in k]
+        fp8_keys = [k for k in kcols if 'fp8' in k]
+        best_bf16 = min(bf16_keys, key=lambda k: pairs[k]) if bf16_keys else ""
+        best_fp8 = min(fp8_keys, key=lambda k: pairs[k]) if fp8_keys else ""
+
+        row = "%6dns | %4.1f |" % (tns, pr)
+        for k in kcols:
+            row += " %7.2fus %4.1f |" % (pairs[k], ovlps[k])
+        row += " %-9s %s" % (best_bf16, best_fp8)
+        print(row)
+
     print()
