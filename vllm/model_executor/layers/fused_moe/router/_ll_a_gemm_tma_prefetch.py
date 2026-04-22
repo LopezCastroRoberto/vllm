@@ -1,18 +1,3 @@
-"""TMA-based fp8 A GEMM — pipelined A+B, k-phase interleaved (v2).
-
-Warp layout (256 threads = 8 warps):
-  Warps 0-3: Compute (MMA), k-phase interleaving across all k_tiles
-  Warps 4-5: B DMA (weights, NO PDL wait)
-  Warps 6-7: A DMA (activations, PDL wait first)
-
-3-barrier protocol per stage:
-  bar_b[STAGES]: B data ready (init=1)
-  bar_a[STAGES]: A data ready (init=1)
-  bar_consumed[STAGES]: consumed by all 4 compute warps (init=128)
-
-TMA SWIZZLE_128B (box_cols=64 bf16) matches CuTe Swizzle<3,3,3>.
-"""
-
 import math
 import ctypes
 
