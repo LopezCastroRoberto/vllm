@@ -36,6 +36,19 @@ def prefetch_tensormap(desc_ptr, *, loc=None, ip=None):
         constraints="l",
         has_side_effects=True, loc=loc, ip=ip)
 
+@dsl_user_op
+def mbarrier_try_wait(mbar_ptr, phase, *, loc=None, ip=None):
+    """Non-blocking try_wait. Returns 1 if phase completed, 0 otherwise."""
+    mbar_llvm = mbar_ptr.to_llvm_ptr(loc=loc, ip=ip) if hasattr(mbar_ptr, 'to_llvm_ptr') else mbar_ptr.ir_value(loc=loc, ip=ip)
+    phase_ir = phase.ir_value(loc=loc, ip=ip)
+    i32 = cutlass.Int32.mlir_type
+    result = _llvm.inline_asm(
+        i32, [mbar_llvm, phase_ir],
+        "{\n.reg .pred P1;\nmbarrier.try_wait.parity.shared::cta.b64 P1, [$0], $1;\nselp.b32 $2, 1, 0, P1;\n}\n",
+        "r,r,=r",
+        has_side_effects=True, loc=loc, ip=ip)
+    return cutlass.Int32(result)
+
 
 @dsl_user_op
 def mbarrier_arrive(mbar_ptr, *, loc=None, ip=None):
@@ -300,13 +313,23 @@ class LLAGemmTmaPrefetch:
             K_PER_WARP: cutlass.Constexpr = num_k_block // NUM_MMA_WARPS
 
             # Main loop: ALL warps process ALL k_tiles, k-phase interleaved
+            # Pre-check first stage (speculative prefetch for fp8 try_wait path)
+            b_rdy = mbarrier_try_wait(bar_b_base + 0, cutlass.Int32(0))
+            a_rdy = mbarrier_try_wait(bar_a_base + 0, cutlass.Int32(0))
+
             for k_tile in range(K_TILES):
                 STAGE: cutlass.Constexpr = k_tile % STAGES
                 PHASE: cutlass.Constexpr = (k_tile // STAGES) % 2
 
-                # Wait for B and A data ready
-                cute.arch.mbarrier_wait(bar_b_base + STAGE, PHASE)
-                cute.arch.mbarrier_wait(bar_a_base + STAGE, PHASE)
+                if not self.is_fp8:
+                    # bf16: blocking wait
+                    cute.arch.mbarrier_wait(bar_b_base + STAGE, PHASE)
+                    cute.arch.mbarrier_wait(bar_a_base + STAGE, PHASE)
+                else:
+                    # fp8: try_wait spin loop with speculative prefetch
+                    while b_rdy + a_rdy < 2:
+                        b_rdy = mbarrier_try_wait(bar_b_base + STAGE, PHASE)
+                        a_rdy = mbarrier_try_wait(bar_a_base + STAGE, PHASE)
 
                 # MMA: k-phase interleaving (each warp does K_PER_WARP k_blocks)
                 tCsA_p = tCsA_v[None, None, None, STAGE]
@@ -340,6 +363,14 @@ class LLAGemmTmaPrefetch:
                             b_s[4], b_s[5], b_s[6], b_s[7])
                     tCrC[0] = c0; tCrC[1] = c1; tCrC[2] = c2; tCrC[3] = c3
                     tCrC[4] = c4; tCrC[5] = c5; tCrC[6] = c6; tCrC[7] = c7
+
+                # Speculatively prefetch next stage barriers (fp8 only)
+                if self.is_fp8:
+                    if k_tile + 1 < K_TILES:
+                        NEXT_STAGE: cutlass.Constexpr = (k_tile + 1) % STAGES
+                        NEXT_PHASE: cutlass.Constexpr = ((k_tile + 1) // STAGES) % 2
+                        b_rdy = mbarrier_try_wait(bar_b_base + NEXT_STAGE, NEXT_PHASE)
+                        a_rdy = mbarrier_try_wait(bar_a_base + NEXT_STAGE, NEXT_PHASE)
 
                 # All 128 compute threads signal data consumed
                 mbarrier_arrive(bar_c_base + STAGE)
