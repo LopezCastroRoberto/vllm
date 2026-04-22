@@ -52,6 +52,14 @@ def _reference(a, b):
     return torch.mm(a.float(), b.float().T)
 
 
+def _check(out, ref, atol, rtol, label=""):
+    err = (out.float() - ref.float()).abs()
+    max_abs = err.max().item()
+    max_rel = (err / ref.float().abs().clamp(min=1e-6)).max().item()
+    print(f"  {label}: max_abs={max_abs:.2e} max_rel={max_rel:.2e}")
+    torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
+
+
 # --- Correctness tests ---
 
 
@@ -61,7 +69,7 @@ def test_bf16_correctness(M, N, K, desc):
     a, b = _make_inputs(M, N, K, torch.bfloat16)
     out = ll_router_gemm(a, b)
     ref = _reference(a, b)
-    torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
+    _check(out, ref, atol=1e-3, rtol=1e-3, label=f"{M}x{N}x{K}")
 
 
 @pytest.mark.parametrize("M", M_VALUES)
@@ -74,7 +82,7 @@ def test_fp8_correctness(M, N, K, desc):
     a, b = _make_inputs(M, N, K, torch.float8_e4m3fn)
     out = ll_router_gemm(a, b)
     ref = _reference(a, b)
-    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+    _check(out, ref, atol=1e-2, rtol=1e-2, label=f"fp8 {M}x{N}x{K}")
 
 
 @pytest.mark.parametrize("M", [1, 4, 16])
@@ -103,7 +111,7 @@ def test_arbitrary_N(N):
     a, b = _make_inputs(M, N, K, torch.bfloat16)
     out = ll_router_gemm(a, b)
     ref = _reference(a, b)
-    torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
+    _check(out, ref, atol=1e-3, rtol=1e-3, label=f"{M}x{N}x{K}")
 
 
 @pytest.mark.parametrize("K", [128, 256, 512, 1024, 2048, 4096, 7168])
@@ -113,7 +121,7 @@ def test_arbitrary_K(K):
     a, b = _make_inputs(M, N, K, torch.bfloat16)
     out = ll_router_gemm(a, b)
     ref = _reference(a, b)
-    torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
+    _check(out, ref, atol=1e-3, rtol=1e-3, label=f"{M}x{N}x{K}")
 
 
 def test_small_K():
@@ -122,7 +130,7 @@ def test_small_K():
     a, b = _make_inputs(M, N, K, torch.bfloat16)
     out = ll_router_gemm(a, b)
     ref = _reference(a, b)
-    torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
+    _check(out, ref, atol=1e-3, rtol=1e-3, label=f"{M}x{N}x{K}")
 
 
 def test_cudagraph_compatible():
@@ -141,4 +149,4 @@ def test_cudagraph_compatible():
     torch.accelerator.synchronize()
 
     ref = _reference(a, b)
-    torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
+    _check(out, ref, atol=1e-3, rtol=1e-3, label=f"{M}x{N}x{K}")
