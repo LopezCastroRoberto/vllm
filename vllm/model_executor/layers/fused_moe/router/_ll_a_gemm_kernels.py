@@ -468,6 +468,7 @@ class LLAGemm:
             )
 
             cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
 
             cute.copy(
                 tiled_copy_A,
@@ -499,7 +500,6 @@ class LLAGemm:
 
         else:
             # ===== 4 MMA WARPS with k-phase interleaving =====
-            cute.arch.griddepcontrol_wait()
             cute.arch.setmaxregister_increase(232)
 
             lane_id = mma_tidx % 32
@@ -672,4 +672,4 @@ class LLAGemm:
                         out_r[0] = total.to(self.out_dtype)
                         cute.autovec_copy(out_r, out_t)
 
-        cute.arch.griddepcontrol_launch_dependents()
+        cute.arch.sync_threads()

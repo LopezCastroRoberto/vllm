@@ -1,3 +1,18 @@
+"""TMA-based fp8 A GEMM — pipelined A+B, k-phase interleaved (v2).
+
+Warp layout (256 threads = 8 warps):
+  Warps 0-3: Compute (MMA), k-phase interleaving across all k_tiles
+  Warps 4-5: B DMA (weights, NO PDL wait)
+  Warps 6-7: A DMA (activations, PDL wait first)
+
+3-barrier protocol per stage:
+  bar_b[STAGES]: B data ready (init=1)
+  bar_a[STAGES]: A data ready (init=1)
+  bar_consumed[STAGES]: consumed by all 4 compute warps (init=128)
+
+TMA SWIZZLE_128B (box_cols=64 bf16) matches CuTe Swizzle<3,3,3>.
+"""
+
 import math
 import ctypes
 
@@ -25,6 +40,16 @@ def tma_load_2d(desc_ptr, smem_ptr, mbar_ptr, coord_x, coord_y, *, loc=None, ip=
         dstMem=smem_llvm, tmaDescriptor=desc_llvm,
         coordinates=coords, mbar=mbar_llvm,
         im2colOffsets=[], loc=loc, ip=ip)
+
+
+@dsl_user_op
+def prefetch_tensormap(desc_ptr, *, loc=None, ip=None):
+    desc_llvm = desc_ptr.to_llvm_ptr(loc=loc, ip=ip) if hasattr(desc_ptr, "to_llvm_ptr") else desc_ptr.ir_value(loc=loc, ip=ip)
+    _llvm.inline_asm(
+        res=None, operands_=[desc_llvm],
+        asm_string="prefetch.tensormap [$0];",
+        constraints="l",
+        has_side_effects=True, loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -180,6 +205,9 @@ class LLAGemmTmaPrefetch:
                 cute.arch.mbarrier_init(bar_b_base + i, 1)
                 cute.arch.mbarrier_init(bar_a_base + i, 1)
                 cute.arch.mbarrier_init(bar_c_base + i, 128)
+        if tidx == 0:
+            prefetch_tensormap(descA_ptr)
+            prefetch_tensormap(descB_ptr)
         cute.arch.sync_threads()
 
         # === A DMA warps (6-7) ===
@@ -336,7 +364,7 @@ class LLAGemmTmaPrefetch:
                 smem_red_ptr + compute_warp * bM * bN,
                 cute.make_layout((bM, bN), stride=(bN, 1)))
             tCsC_partial = thr_mma.partition_C(smem_warp)
-            
+            cute.autovec_copy(tCrC, tCsC_partial)
 
         # ALL 256 threads sync
         cute.arch.sync_threads()

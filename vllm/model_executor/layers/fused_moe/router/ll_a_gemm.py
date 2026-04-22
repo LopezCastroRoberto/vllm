@@ -39,8 +39,8 @@ def _get_compiled(is_fp8: bool, a, b, c):
           .mark_compact_shape_dynamic(mode=1, stride_order=(0, 1),
                                       divisibility=div))
 
-    tk = 256 if is_fp8 else 512
-    ns = 5 if is_fp8 else 3
+    tk = 256
+    ns = 4
     gemm = LLAGemm(tile_n=16, tile_k=tk, num_stages=ns,
                     num_dma_warps=4, is_fp8=is_fp8)
     stream = CUstream(current_stream().cuda_stream)
