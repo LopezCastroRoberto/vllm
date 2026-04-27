@@ -935,7 +935,18 @@ __device__ void radix_topk(const scalar_t* __restrict__ row_input,
       for (uint32_t i = tx * VEC_SIZE; i < aligned_size;
            i += kThreadsPerBlock * VEC_SIZE) {
         const __nv_bfloat16* src = row_input + my_chunk_start + i;
-        if constexpr (VEC_SIZE >= 4) {
+        if constexpr (VEC_SIZE == 8) {
+          __nv_bfloat16 v0, v1, v2, v3, v4, v5, v6, v7;
+          load_bf16x8(src, v0, v1, v2, v3, v4, v5, v6, v7);
+          shared_u16[i] = Traits::to_ordered(v0);
+          shared_u16[i + 1] = Traits::to_ordered(v1);
+          shared_u16[i + 2] = Traits::to_ordered(v2);
+          shared_u16[i + 3] = Traits::to_ordered(v3);
+          shared_u16[i + 4] = Traits::to_ordered(v4);
+          shared_u16[i + 5] = Traits::to_ordered(v5);
+          shared_u16[i + 6] = Traits::to_ordered(v6);
+          shared_u16[i + 7] = Traits::to_ordered(v7);
+        } else if constexpr (VEC_SIZE == 4) {
           __nv_bfloat16 v0, v1, v2, v3;
           load_bf16x4(src, v0, v1, v2, v3);
           shared_u16[i] = Traits::to_ordered(v0);
