@@ -1051,7 +1051,7 @@ class DeepseekV4Indexer(nn.Module):
             self.topk_indices_buffer,
             skip_k_cache_insert=True,
             use_fp4_cache=self.use_fp4_kv,
-            use_bf16_scores=True,
+            use_bf16_scores=False,
         )
 
     def forward(
