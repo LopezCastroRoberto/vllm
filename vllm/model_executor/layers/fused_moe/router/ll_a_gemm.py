@@ -9,6 +9,15 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+
+def is_available() -> bool:
+    try:
+        import cutlass.cute  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 # Cache: (is_fp8, swapped) -> compiled callable
 _compiled_cache: dict[tuple, object] = {}
 
