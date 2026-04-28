@@ -51,7 +51,6 @@ def _get_compiled(is_fp8, a, b, c, descA_dev, descB_dev):
     dB = (from_dlpack(descB_dev, assumed_align=64, enable_tvm_ffi=True)
           .mark_layout_dynamic())
 
-    # Input tensor K is already bf16-view K (= original_K/2 for fp8)
     K_eff = K
     gemm = LLAGemmTmaPrefetch(tile_k=256, num_stages=8,
                                K_eff=K_eff, is_fp8=is_fp8)

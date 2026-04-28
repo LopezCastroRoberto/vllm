@@ -18,8 +18,14 @@ try:
 except ImportError:
     _HAS_TGV = False
 
+try:
+    from flashinfer.gemm import tinygemm_bf16
+    _HAS_TINY = True
+except ImportError:
+    _HAS_TINY = False
+
 print(f'Device: {torch.cuda.get_device_name()}')
-print(f'DSV3-A: {_HAS_DSV3} | TGV: {_HAS_TGV}')
+print(f'DSV3-A: {_HAS_DSV3} | TGV: {_HAS_TGV} | tinygemm: {_HAS_TINY}')
 print()
 
 SHAPES = [
@@ -62,14 +68,14 @@ def bench_one(M, K, N):
     except Exception:
         r['t-fp8'] = float('nan')
 
-    # DSV3 fused A GEMM (C++) — only K=7168, N=2112
-    if _HAS_DSV3 and K == 7168 and N == 2112:
+    # DSV3 fused A GEMM (C++) — only K=7168, N=2112, M<=16
+    if _HAS_DSV3 and K == 7168 and N == 2112 and M <= 16:
         o = torch.empty(M, N, dtype=torch.bfloat16, device='cuda')
         r['DSV3'] = _bench(lambda: ops.dsv3_fused_a_gemm(o, a, b.T))
     else:
         r['DSV3'] = float('nan')
 
-    # TGV-sm100 (FlashInfer tinygemm2) — requires N%16==0
+    # TGV-sm100 (FlashInfer) — requires N%16==0
     if _HAS_TGV and N % 16 == 0:
         bias = torch.zeros(N, dtype=torch.bfloat16, device='cuda')
         out = torch.empty(M, N, dtype=torch.bfloat16, device='cuda')
@@ -80,6 +86,20 @@ def bench_one(M, K, N):
     else:
         r['TGV'] = float('nan')
 
+    # tinygemm_bf16 (FlashInfer tinygemm2) — requires N%16==0
+    if _HAS_TINY and N % 16 == 0:
+        bias_t = torch.zeros(N, dtype=torch.bfloat16, device='cuda')
+        out_t = torch.empty(M, N, dtype=torch.bfloat16, device='cuda')
+        try:
+            with autotune(True):                
+                tinygemm_bf16(a, b, out_t, bias=bias_t)
+            torch.cuda.synchronize()
+            r['tiny2'] = _bench(lambda: tinygemm_bf16(a, b, out_t, bias=bias_t))
+        except Exception:
+            r['tiny2'] = float('nan')
+    else:
+        r['tiny2'] = float('nan')
+
     # cuBLAS
     omm = torch.empty(M, N, dtype=torch.bfloat16, device='cuda')
     r['cuBLAS'] = _bench(lambda: torch.mm(a, b.T, out=omm))
@@ -87,7 +107,7 @@ def bench_one(M, K, N):
     return r
 
 
-cols = ['p-bf16', 'p-fp8', 't-bf16', 't-fp8', 'DSV3', 'TGV', 'cuBLAS']
+cols = ['p-bf16', 'p-fp8', 't-bf16', 't-fp8', 'DSV3', 'TGV', 'tiny2', 'cuBLAS']
 
 for K, N, label in SHAPES:
     print(f'=== {label}: K={K}, N={N} ===')
@@ -97,7 +117,7 @@ for K, N, label in SHAPES:
 
     for M in [1, 4, 16]:
         r = bench_one(M, K, N)
-        bf16_cols = ['p-bf16', 't-bf16', 'DSV3', 'TGV', 'cuBLAS']
+        bf16_cols = ['p-bf16', 't-bf16', 'DSV3', 'TGV', 'tiny2', 'cuBLAS']
         fp8_cols = ['p-fp8', 't-fp8']
         best_bf16 = min((k for k in bf16_cols if r[k] == r[k]),
                          key=lambda k: r[k])

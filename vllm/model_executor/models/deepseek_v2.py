@@ -82,6 +82,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from vllm.model_executor.layers.fused_moe.router.ll_a_gemm import ll_a_gemm
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -766,6 +767,10 @@ def _min_latency_fused_qkv_a_proj_impl(
     """
     num_tokens = input_.shape[0]
     if 0 < num_tokens <= 16:
+        try:
+            return ll_a_gemm(input_, weight)
+        except Exception:
+            pass
         output = torch.empty(
             num_tokens,
             weight.shape[0],
