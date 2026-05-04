@@ -21,6 +21,25 @@ from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.batch_invariant import (
     linear_batch_invariant,
 )
+try:
+    from vllm.model_executor.layers.fused_moe.router.ll_a_gemm import (
+        is_available as _has_ll_gemm,
+        ll_a_gemm as _ll_a_gemm,
+    )
+except ImportError:
+    _has_ll_gemm = lambda: False
+    _ll_a_gemm = None
+
+
+def _try_ll_gemm(input_: torch.Tensor, weight: torch.Tensor,
+                 bias: torch.Tensor | None) -> torch.Tensor | None:
+    if (bias is None
+        and input_.shape[0] <= 16
+        and weight.dtype == torch.bfloat16
+        and _has_ll_gemm()):
+        return _ll_a_gemm(input_, weight)
+    return None
+
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -391,7 +410,11 @@ class ReplicatedLinear(LinearBase):
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
 
-        output = self.quant_method.apply(self, x, bias)
+        ll_out = _try_ll_gemm(x, self.weight, bias)
+        if ll_out is not None:
+            output = ll_out
+        else:
+            output = self.quant_method.apply(self, x, bias)
 
         if not self.return_bias:
             return output
@@ -584,7 +607,11 @@ class ColumnParallelLinear(LinearBase):
 
         # Matrix multiply.
         assert self.quant_method is not None
-        output_parallel = self.quant_method.apply(self, input_, bias)
+        ll_out = _try_ll_gemm(input_, self.weight, bias)
+        if ll_out is not None:
+            output_parallel = ll_out
+        else:
+            output_parallel = self.quant_method.apply(self, input_, bias)
 
         if self.gather_output and self.tp_size > 1:
             # All-gather across the partitions.
@@ -1557,7 +1584,11 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+        ll_out = _try_ll_gemm(input_parallel, self.weight, bias_)
+        if ll_out is not None:
+            output_parallel = ll_out
+        else:
+            output_parallel = self.quant_method.apply(self, input_parallel, bias_)
 
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)
