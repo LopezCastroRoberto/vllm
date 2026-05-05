@@ -929,9 +929,12 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
     if (cta_in_group == 0) {
       for (uint32_t buf = 0; buf < 3; buf++) {
         for (uint32_t i = tx; i < RADIX; i += kThreadsPerBlock) {
-          st_release(reinterpret_cast<int*>(&state->histogram[buf][i]), 0);
+          int* ptr = reinterpret_cast<int*>(&state->histogram[buf][i]);
+          asm volatile("st.global.cg.b32 [%0], %1;\n" : : "l"(ptr), "r"(0));
         }
       }
+
+      __syncthreads();
       if (tx == 0) {
         st_release(&state->arrival_counter, 0);
       }
