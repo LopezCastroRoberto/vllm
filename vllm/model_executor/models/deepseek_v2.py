@@ -85,6 +85,8 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 
 _ll_a_gemm_enabled = False
+_ll_a_gemm_compiled = {}  # {swapped: compiled_fn}
+_ll_a_gemm_stream = None
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -769,10 +771,17 @@ def _min_latency_fused_qkv_a_proj_impl(
     num_tokens = input_.shape[0]
     if 0 < num_tokens <= 16:
         if _ll_a_gemm_enabled:
-            from vllm.model_executor.layers.fused_moe.router.ll_a_gemm import (
-                ll_a_gemm,
-            )
-            return ll_a_gemm(input_, weight)
+            stream = torch.cuda.current_stream().cuda_stream
+            M = num_tokens
+            N = weight.shape[0]
+            if M <= 8:
+                out = torch.empty(N, M, dtype=torch.bfloat16, device=input_.device)
+                _ll_a_gemm_compiled[True](weight, input_, out, stream)
+                return out.T
+            else:
+                out = torch.empty(M, N, dtype=torch.bfloat16, device=input_.device)
+                _ll_a_gemm_compiled[False](input_, weight, out, stream)
+                return out
         output = torch.empty(
             num_tokens,
             weight.shape[0],
@@ -837,16 +846,20 @@ class DeepSeekV2FusedQkvAProjLinear(MergedColumnParallelLinear):
                 ll_a_gemm,
             )
             if is_available():
-                ll_a_gemm(
-                    torch.zeros(1, self.weight.shape[1],
-                                dtype=torch.bfloat16,
-                                device=self.weight.device),
-                    self.weight)
-                ll_a_gemm(
-                    torch.zeros(16, self.weight.shape[1],
-                                dtype=torch.bfloat16,
-                                device=self.weight.device),
-                    self.weight)
+                from cuda.bindings.driver import CUstream
+                from torch.cuda import current_stream
+                from vllm.model_executor.layers.fused_moe.router.ll_a_gemm import (
+                    _get_compiled,
+                )
+                # Warmup both swapped (M<=8) and normal (M>8) paths
+                K, N = self.weight.shape[1], self.weight.shape[0]
+                d1 = torch.zeros(1, K, dtype=torch.bfloat16, device=self.weight.device)
+                o1 = torch.empty(N, 1, dtype=torch.bfloat16, device=self.weight.device)
+                _ll_a_gemm_compiled[True] = _get_compiled(False, True, self.weight, d1, o1)
+                d16 = torch.zeros(16, K, dtype=torch.bfloat16, device=self.weight.device)
+                o16 = torch.empty(16, N, dtype=torch.bfloat16, device=self.weight.device)
+                _ll_a_gemm_compiled[False] = _get_compiled(False, False, d16, self.weight, o16)
+
                 _ll_a_gemm_enabled = True
                 logger.info("cuteDSL ll_a_gemm enabled for fused_qkv_a_proj")
 
