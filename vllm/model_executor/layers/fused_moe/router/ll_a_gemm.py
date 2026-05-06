@@ -55,7 +55,7 @@ def _get_compiled(is_fp8: bool, swapped: bool, a, b, c):
 
     tk = 256
     tn = 8 if swapped else 16
-    ns = 4
+    ns = 12
     gemm = LLAGemm(tile_n=tn, tile_k=tk, num_stages=ns,
                     num_dma_warps=4, is_fp8=is_fp8)
     stream = CUstream(current_stream().cuda_stream)
