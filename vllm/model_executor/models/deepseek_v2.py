@@ -86,6 +86,8 @@ from vllm.model_executor.models.utils import sequence_parallel_chunk
 
 _ll_a_gemm_enabled = False
 _ll_a_gemm_compiled = {}  # {swapped: compiled_fn}
+_ll_a_gemm_buf_swapped = None  # pre-allocated [N, 16] for swapped path
+_ll_a_gemm_buf_normal = None   # pre-allocated [16, N] for normal path
 _ll_a_gemm_stream = None
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -772,14 +774,12 @@ def _min_latency_fused_qkv_a_proj_impl(
     if 0 < num_tokens <= 16:
         if _ll_a_gemm_enabled:
             stream = torch.cuda.current_stream().cuda_stream
-            M = num_tokens
-            N = weight.shape[0]
-            if M <= 8:
-                out = torch.empty(N, M, dtype=torch.bfloat16, device=input_.device)
+            if num_tokens <= 8:
+                out = _ll_a_gemm_buf_swapped[:, :num_tokens]
                 _ll_a_gemm_compiled[True](weight, input_, out, stream)
                 return out.T
             else:
-                out = torch.empty(M, N, dtype=torch.bfloat16, device=input_.device)
+                out = _ll_a_gemm_buf_normal[:num_tokens, :]
                 _ll_a_gemm_compiled[False](input_, weight, out, stream)
                 return out
         output = torch.empty(
@@ -860,6 +860,9 @@ class DeepSeekV2FusedQkvAProjLinear(MergedColumnParallelLinear):
                 o16 = torch.empty(16, N, dtype=torch.bfloat16, device=self.weight.device)
                 _ll_a_gemm_compiled[False] = _get_compiled(False, False, d16, self.weight, o16)
 
+                global _ll_a_gemm_buf_swapped, _ll_a_gemm_buf_normal
+                _ll_a_gemm_buf_swapped = torch.empty(N, 16, dtype=torch.bfloat16, device=self.weight.device)
+                _ll_a_gemm_buf_normal = torch.empty(16, N, dtype=torch.bfloat16, device=self.weight.device)
                 _ll_a_gemm_enabled = True
                 logger.info("cuteDSL ll_a_gemm enabled for fused_qkv_a_proj")
 
