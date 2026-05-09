@@ -144,6 +144,49 @@ class FP8ScaledMMLinearKernel(
                 x_s,
                 x_s_ub,
             )
+        # Low-latency FP8 GEMM dispatch for small M (autotuned)
+        if (hasattr(layer, '_use_ll_gemm_fp8') and layer._use_ll_gemm_fp8
+                and x_2d_q.shape[0] <= 8):
+            from vllm.model_executor.layers.fused_moe.router.ll_a_gemm import (
+                _get_compiled_splitk,
+            )
+            from cuda.bindings.driver import CUstream
+            from torch.cuda import current_stream
+
+            M = x_2d_q.shape[0]
+            x8 = x_2d_q.view(torch.bfloat16)
+            w8 = w.T.view(torch.bfloat16)  # zero copy: .t() is metadata-only
+            N = w8.shape[0]
+            K_view = w8.shape[1]
+
+            # Fix tight strides for M=1
+            if M == 1 and x8.stride(0) != x8.shape[1]:
+                buf = torch.empty_like(x8)
+                buf.copy_(x8)
+                x8 = buf
+
+            # Autotuned config selection based on N and K
+            tiles = K_view // 256
+            if N <= 256 and tiles >= 8:
+                split_k, ns = 8, min(3, tiles // 8)
+            elif N <= 1536 and tiles >= 4:
+                split_k, ns = 4, min(4, tiles // 4)
+            elif N <= 3072 and tiles >= 4:
+                split_k, ns = 4, min(2, tiles // 4)
+            else:
+                split_k = 0  # fall through to scaled_mm
+
+            if split_k > 0 and tiles % split_k == 0:
+                combined_scale = (x_s * w_s).item()
+                out_buf = torch.empty(N, M, dtype=torch.bfloat16, device=x8.device)
+                compiled = _get_compiled_splitk(True, True, w8, x8, out_buf, split_k, ns)
+                stream = CUstream(current_stream().cuda_stream)
+                compiled(w8, x8, out_buf, stream, combined_scale)
+                out = out_buf.T
+                if bias is not None:
+                    out = out + bias
+                return out.view(*output_shape)
+
         return self.apply_scaled_mm(
             A=x_2d_q,
             B=w,

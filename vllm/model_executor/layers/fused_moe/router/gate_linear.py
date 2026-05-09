@@ -66,7 +66,8 @@ class GateLinear(ReplicatedLinear):
                     is_available,
                 )
 
-                self.allow_ll_router_gemm = is_available()
+                self.allow_ll_router_gemm = True
+                #self.allow_ll_router_gemm = is_available()
             except ImportError:
                 pass
 

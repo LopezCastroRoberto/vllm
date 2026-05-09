@@ -47,7 +47,7 @@ def _get_compiled(M: int, is_fp8: bool, K: int, N: int, a_flat, b_flat, c_flat):
 
     from ._ll_router_gemm_kernels import host_bf16, host_fp8
 
-    key = (M, is_fp8)
+    key = (M, is_fp8, K)
     if key in _compiled_cache:
         return _compiled_cache[key]
 
@@ -105,8 +105,12 @@ def ll_router_gemm(
     compiled = _get_compiled(M, is_fp8, K, N, a_flat, b_flat, c_flat)
 
     # TVM FFI: pass torch tensors directly (no from_dlpack on hot path)
-    K_eff = K // 2 if is_fp8 else K
     stream = CUstream(current_stream().cuda_stream)
-    compiled(a_flat, b_flat, c_flat, K_eff, N, stream)
+    if is_fp8:
+        K_eff = K // 2
+        compiled(a_flat, b_flat, c_flat, K_eff, N, stream)
+    else:
+        # K is baked in as Constexpr for bf16
+        compiled(a_flat, b_flat, c_flat, N, stream)
 
     return output
