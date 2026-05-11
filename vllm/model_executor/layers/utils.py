@@ -11,6 +11,11 @@ from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
+from vllm.model_executor.layers.fused_moe.router.ll_a_gemm import (
+    _get_compiled_splitk,
+)
+from cuda.bindings.driver import CUstream
+from torch.cuda import current_stream
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -96,6 +101,58 @@ def default_unquantized_gemm(
     bias: torch.Tensor | None = None,
 ):
     return torch.nn.functional.linear(x, weight, bias)
+
+def _ll_gemm_fp8_scaled_mm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    bias: torch.Tensor | None,
+    output_shape: list,
+) -> torch.Tensor | None:
+    """Low-latency FP8 split-K GEMM for small-M decode.
+    Returns output tensor or None to fall through to scaled_mm."""
+    num_tokens = A.shape[0]
+    if num_tokens > 8:
+        return None
+
+    x8 = A.view(torch.bfloat16)
+    w8 = B.T.view(torch.bfloat16)
+    N = w8.shape[0]
+    K_view = w8.shape[1]
+
+    if N > 4096: # Not a LL kernel. Need other kernel designs.
+        return None
+
+    #TODO(roberto): sk values do not guarantee tiles%sk==0 for all K.
+    # Should pick sk that divides tiles. 
+    # Longer-term: implement an autotuner.
+    tiles = K_view // 256
+    if N <= 256 and tiles >= 8:
+        split_k, ns = 8, min(3, tiles // 8)
+    elif N <= 1536 and tiles >= 4:
+        split_k, ns = 4, min(4, tiles // 4)
+    elif N <= 3072 and tiles >= 4:
+        split_k, ns = 4, min(2, tiles // 4)
+    else:
+        return None
+
+    if tiles % split_k != 0:
+        return None
+
+    combined_scale = (As * Bs).item()    
+    out_buf = torch.empty(N * num_tokens, dtype=torch.bfloat16, device=x8.device)
+    out_for_kernel = out_buf.view(N, num_tokens)
+    compiled = _get_compiled_splitk(True, True, w8, x8, out_for_kernel, split_k, ns)
+    stream = CUstream(current_stream().cuda_stream)
+    compiled(w8, x8, out_for_kernel, stream, combined_scale)
+    out = out_buf.view(num_tokens, N)
+    # TODO(roberto): fuse bias into the kernel
+    if bias is not None:
+        out = out + bias
+    return out.view(*output_shape)
+
+
 
 
 def use_aiter_triton_gemm(n, m, k, dtype):

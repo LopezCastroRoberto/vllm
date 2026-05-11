@@ -112,7 +112,7 @@ def _get_compiled_splitk(is_fp8: bool, swapped: bool, a, b, c, split_k: int, num
     K = a.shape[1]
     tiles = K // 256
     ns = num_stages if num_stages > 0 else min(12, tiles // split_k)
-    cache_key = (is_fp8, swapped, split_k, ns)
+    cache_key = (is_fp8, swapped, split_k, ns, swapped)  # transpose_output=swapped
     if cache_key in _splitk_cache:
         return _splitk_cache[cache_key]
 
@@ -135,7 +135,8 @@ def _get_compiled_splitk(is_fp8: bool, swapped: bool, a, b, c, split_k: int, num
                                       divisibility=c_div))
 
     gemm = LLAGemm(tile_n=tn, tile_k=256, num_stages=ns,
-                    num_dma_warps=4, is_fp8=is_fp8, split_k=split_k)
+                    num_dma_warps=4, is_fp8=is_fp8, split_k=split_k,
+                    transpose_output=swapped)
     stream = CUstream(current_stream().cuda_stream)
     compiled = cute.compile(gemm.call_splitk, mA, mB, mC, stream,
                             options="--enable-tvm-ffi")

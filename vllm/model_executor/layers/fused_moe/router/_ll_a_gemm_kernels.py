@@ -277,6 +277,7 @@ class LLAGemm:
         is_fp8: bool = False,
         num_dma_warps: int = 4,
         split_k: int = 1,
+        transpose_output: bool = False,
     ):
         self.ab_dtype = ab_dtype
         self.acc_dtype = acc_dtype
@@ -288,6 +289,7 @@ class LLAGemm:
         self.num_stages = num_stages
         self.is_fp8 = is_fp8
         self.split_k = split_k
+        self.transpose_output = transpose_output
         self.mma_shape = (16, 8, 16)
         # (1,1,1) = 32 threads per MMA warp
         # 4 MMA warps doing k-phase interleaving on tile_n=16
@@ -957,7 +959,10 @@ class LLAGemm:
                             cb_r = cute.make_rmem_tensor((1,), cutlass.Float32)
                             cute.autovec_copy(cb_t, cb_r)
                             acc = acc + cb_r[0]
-                        out_p = (mC.iterator + global_m * N_out + global_n).align(2)
+                        out_r0 = global_n if self.transpose_output else global_m
+                        out_r1 = global_m if self.transpose_output else global_n
+                        out_s = M_out if self.transpose_output else N_out
+                        out_p = (mC.iterator + out_r0 * out_s + out_r1).align(2)
                         out_t = cute.make_tensor(out_p, cute.make_layout((1,)))
                         out_r = cute.make_rmem_tensor((1,), self.out_dtype)
                         out_r[0] = acc.to(self.out_dtype)

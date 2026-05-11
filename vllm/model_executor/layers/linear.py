@@ -32,26 +32,18 @@ except ImportError:
 
 
 def _init_ll_gemm_flag(layer):
-    """Set _use_ll_gemm / _use_ll_gemm_fp8 flags once per layer.
+    """Set _use_ll_gemm flag once per layer.
     bf16: N <= 4096, unquantized, no bias.
     fp8: per-tensor FP8 (not block-scaled), N <= 4096, no bias.
     """
     from vllm.model_executor.layers.fused_moe import GateLinear
     layer._use_ll_gemm = False
-    layer._use_ll_gemm_fp8 = False
 
     if not _has_ll_gemm() or isinstance(layer, GateLinear):
         return
     if layer.bias is not None or not hasattr(layer, 'weight'):
         return
 
-    # FP8 per-tensor path: weight is [K, N] (transposed)
-    if (layer.weight.dtype == torch.float8_e4m3fn
-            and hasattr(layer, 'weight_scale')
-            and hasattr(layer, 'input_scale')
-            and not hasattr(layer, 'weight_scale_inv')
-            and layer.weight.shape[1] <= 4096):
-        layer._use_ll_gemm_fp8 = True
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,

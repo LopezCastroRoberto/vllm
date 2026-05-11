@@ -40,8 +40,8 @@ parser.add_argument('--nsys-N', type=int, default=2112, help=argparse.SUPPRESS)
 args = parser.parse_args()
 
 # Shared: split-K autotuning (used by both nsys and normal mode) 
-#RLC: need to autotune under L2 cache pollution for nsys+CG
-#RLC: need to add autotuner to vLLM 
+#TODO (roberto): need to autotune under L2 cache pollution for nsys+CG
+#TODO (roberto): need to add autotuner to vLLM 
 _sk_cache = {}
 
 def _get_best_splitk(a8, b8, M, K_phys, N):

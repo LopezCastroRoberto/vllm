@@ -156,13 +156,14 @@ def test_splitk_fp8(M, K, N, desc, sk, ns):
     b8 = b_fp8.view(torch.bfloat16)
     ref = _ref_fp8(a_fp8, b_fp8)
 
-    out = torch.empty(N, M, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty(N*M, dtype=torch.bfloat16, device="cuda").view(N, M)
     compiled = _get_compiled_splitk(True, True, b8, a8, out, sk, ns)
     compiled(b8, a8, out, CUstream(current_stream().cuda_stream), 1.0)
     torch.cuda.synchronize()
 
-    assert out.T.shape == (M, N)
-    _assert_correct(out.T, ref, min_cos_sim=0.98, context=f"sk{sk}_ns{ns} M={M} {desc}")
+    result = out.view(M, N)
+    assert result.shape == (M, N)
+    _assert_correct(result, ref, min_cos_sim=0.98, context=f"sk{sk}_ns{ns} M={M} {desc}")
 
 
 # ===== Cross-validation: peeled vs TMA must agree =====
@@ -197,12 +198,12 @@ def test_splitk_vs_nosplitk_fp8(M):
 
     out_nosplit = ll_a_gemm(a8, b8, is_fp8=True)
 
-    out_sk = torch.empty(N, M, dtype=torch.bfloat16, device="cuda")
+    out_sk = torch.empty(N*M, dtype=torch.bfloat16, device="cuda").view(N, M)
     compiled = _get_compiled_splitk(True, True, b8, a8, out_sk, split_k=8, num_stages=3)
     compiled(b8, a8, out_sk, CUstream(current_stream().cuda_stream), 1.0)
     torch.cuda.synchronize()
 
-    _assert_correct(out_sk.T, out_nosplit, min_cos_sim=0.999,
+    _assert_correct(out_sk.view(M, N), out_nosplit, min_cos_sim=0.999,
                     context=f"sk_vs_nosk M={M}")
 
 
@@ -316,7 +317,7 @@ def test_cudagraph_splitk():
     a8, b8 = a_fp8.view(torch.bfloat16), b_fp8.view(torch.bfloat16)
     ref = _ref_fp8(a_fp8, b_fp8)
 
-    out = torch.empty(256, 1, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty(256*1, dtype=torch.bfloat16, device="cuda").view(256, 1)
     compiled = _get_compiled_splitk(True, True, b8, a8, out, split_k=8, num_stages=3)
     compiled(b8, a8, out, CUstream(current_stream().cuda_stream), 1.0)
     torch.cuda.synchronize()
@@ -329,7 +330,8 @@ def test_cudagraph_splitk():
         g.replay()
     torch.cuda.synchronize()
 
-    _assert_correct(out.T, ref, min_cos_sim=0.98, context="CG_splitk")
+    result = out.view(1, 256)
+    _assert_correct(result, ref, min_cos_sim=0.98, context="CG_splitk")
 
 
 def test_cudagraph_repeated_replay():
