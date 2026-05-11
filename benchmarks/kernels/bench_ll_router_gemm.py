@@ -107,7 +107,6 @@ SHAPES = [
     (64, 2880, "Non-aligned K"),
 ]
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--save-path", type=str, default=None)
