@@ -21,28 +21,6 @@ from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.batch_invariant import (
     linear_batch_invariant,
 )
-try:
-    from vllm.model_executor.layers.fused_moe.router.ll_a_gemm import (
-        is_available as _has_ll_gemm,
-        ll_a_gemm as _ll_a_gemm,
-    )
-except ImportError:
-    _has_ll_gemm = lambda: False
-    _ll_a_gemm = None
-
-
-def _init_ll_gemm_flag(layer):
-    """Set _use_ll_gemm flag once per layer.
-    bf16: N <= 4096, unquantized, no bias.
-    fp8: per-tensor FP8 (not block-scaled), N <= 4096, no bias.
-    """
-    from vllm.model_executor.layers.fused_moe import GateLinear
-    layer._use_ll_gemm = False
-
-    if not _has_ll_gemm() or isinstance(layer, GateLinear):
-        return
-    if layer.bias is not None or not hasattr(layer, 'weight'):
-        return
 
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -414,12 +392,7 @@ class ReplicatedLinear(LinearBase):
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
 
-        if not hasattr(self, '_use_ll_gemm'):
-            _init_ll_gemm_flag(self)
-        if self._use_ll_gemm and x.shape[0] <= 16 and x.is_contiguous():
-            output = _ll_a_gemm(x, self.weight)
-        else:
-            output = self.quant_method.apply(self, x, bias)
+        output = self.quant_method.apply(self, x, bias)
 
         if not self.return_bias:
             return output
@@ -612,12 +585,7 @@ class ColumnParallelLinear(LinearBase):
 
         # Matrix multiply.
         assert self.quant_method is not None
-        if not hasattr(self, '_use_ll_gemm'):
-            _init_ll_gemm_flag(self)
-        if self._use_ll_gemm and input_.shape[0] <= 16 and input_.is_contiguous():
-            output_parallel = _ll_a_gemm(input_, self.weight)
-        else:
-            output_parallel = self.quant_method.apply(self, input_, bias)
+        output_parallel = self.quant_method.apply(self, input_, bias)
 
         if self.gather_output and self.tp_size > 1:
             # All-gather across the partitions.
@@ -1590,12 +1558,7 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        if not hasattr(self, '_use_ll_gemm'):
-            _init_ll_gemm_flag(self)
-        if self._use_ll_gemm and input_parallel.shape[0] <= 16 and input_parallel.is_contiguous():
-            output_parallel = _ll_a_gemm(input_parallel, self.weight)
-        else:
-            output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+        output_parallel = self.quant_method.apply(self, input_parallel, bias_)
 
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)

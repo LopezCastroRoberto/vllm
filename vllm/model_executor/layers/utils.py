@@ -11,11 +11,6 @@ from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
-from vllm.model_executor.layers.fused_moe.router.ll_a_gemm import (
-    _get_compiled_splitk,
-)
-from cuda.bindings.driver import CUstream
-from torch.cuda import current_stream
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -93,6 +88,35 @@ def apply_penalties(
     logits -= presence_penalties.unsqueeze(dim=1) * output_mask
     return logits
 
+def _check_ll_gemm() -> bool:
+    try:
+        from vllm.model_executor.layers.fused_moe.router.ll_a_gemm import is_available
+        return is_available()
+    except ImportError:
+        return False
+
+def _ll_gemm_unquantized_gemm(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+):
+    num_tokens = x.numel() // x.shape[-1]
+    N = weight.shape[0]
+    if (
+        num_tokens <= 16
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and N <= 4096 #TODO(roberto): larger Ns require other kernel designs.
+        and bias is None #TODO(roberto): support bias
+        and x.is_contiguous()
+        and weight.is_contiguous()
+    ):
+        from vllm.model_executor.layers.fused_moe.router.ll_a_gemm import ll_a_gemm
+        out_shape = (*x.shape[:-1], N)
+        result = ll_a_gemm(x.view(num_tokens, -1), weight)
+        return result.view(out_shape)
+    return torch.nn.functional.linear(x, weight, bias)
 
 def default_unquantized_gemm(
     layer: torch.nn.Module,
@@ -112,11 +136,17 @@ def _ll_gemm_fp8_scaled_mm(
 ) -> torch.Tensor | None:
     """Low-latency FP8 split-K GEMM for small-M decode.
     Returns output tensor or None to fall through to scaled_mm."""
+    if not _check_ll_gemm():
+        return None
     num_tokens = A.shape[0]
-    if num_tokens > 8:
+    if num_tokens > 8: #TODO(roberto): Try to push this barrier up to 16.
         return None
 
     x8 = A.view(torch.bfloat16)
+    from vllm.model_executor.layers.fused_moe.router.ll_a_gemm import _get_compiled_splitk
+    from cuda.bindings.driver import CUstream
+    from torch.cuda import current_stream
+
     w8 = B.T.view(torch.bfloat16)
     N = w8.shape[0]
     K_view = w8.shape[1]
@@ -151,7 +181,6 @@ def _ll_gemm_fp8_scaled_mm(
     if bias is not None:
         out = out + bias
     return out.view(*output_shape)
-
 
 
 
@@ -368,5 +397,7 @@ def dispatch_unquantized_gemm() -> Callable[..., torch.Tensor]:
         return rocm_unquantized_gemm
     elif current_platform.is_cpu():
         return cpu_unquantized_gemm
+    elif _check_ll_gemm():
+        return _ll_gemm_unquantized_gemm
     else:
         return default_unquantized_gemm
