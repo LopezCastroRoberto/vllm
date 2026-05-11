@@ -40,7 +40,8 @@ parser.add_argument('--nsys-N', type=int, default=2112, help=argparse.SUPPRESS)
 args = parser.parse_args()
 
 # Shared: split-K autotuning (used by both nsys and normal mode) 
-# need to autotune under L2 cache pollution for nsys+CG
+#RLC: need to autotune under L2 cache pollution for nsys+CG
+#RLC: need to add autotuner to vLLM 
 _sk_cache = {}
 
 def _get_best_splitk(a8, b8, M, K_phys, N):
@@ -79,7 +80,6 @@ def _get_best_splitk(a8, b8, M, K_phys, N):
             except Exception:
                 pass
     return best_t * 1000 if best_t < float('inf') else float('nan'), best_compiled
-
 
 if args.nsys_kernel:
     from torch.cuda import current_stream as _cs
@@ -197,7 +197,6 @@ SHAPES = [
     (512, 32768,  "kv_b_proj TP1"),
     (512, 4096,   "kv_b_proj TP8"),
     (512, 8192,   "kv_b_proj TP4"),
-    # Mistral-Medium-3.5-128B (FP8 only)
     (12288, 3072, "Mistral TP4 Q [FP8]"),
     (12288, 256,  "Mistral TP4 K/V [FP8]"),
     (12288, 1536, "Mistral TP8 Q [FP8]"),
@@ -207,27 +206,12 @@ SHAPES = [
 def _bench(fn):
     return do_bench_cudagraph(fn, quantiles=q)[0] * 1000
 
-
-
-
-# ---------------------------------------------------------------------------
-# nsys+CG cold-L2 profiling
-# ---------------------------------------------------------------------------
-_nsys_cache = {}
-
-def _bench_nsys_l2(kernel_type, M, K, N):
-    cache_key = (M, K, N)
-    if cache_key not in _nsys_cache:
-        _nsys_cache[cache_key] = _run_nsys_batch(M, K, N)
-    return _nsys_cache[cache_key].get(kernel_type, float('nan'))
-
-
 def _run_nsys_batch(M, K, N):
     import subprocess, shutil
 
     nsys = shutil.which('nsys') or '/usr/local/bin/nsys'
     script = os.path.abspath(sys.argv[0])
-    
+
     kt_list = ['p-fp8', 'sk-fp8', 't-fp8', 'smm']
     if K <= 7168:
         kt_list = ['p-bf16', 't-bf16', 'cuBLAS', 'fi-bf16'] + kt_list
@@ -283,38 +267,21 @@ def _run_nsys_batch(M, K, N):
         pass
     return results
 
-
 bf16_keys = ['p-bf16', 't-bf16', 'DSV3', 'TGV', 'fi-bf16', 'cuBLAS']
 fp8_keys = ['p-fp8', 'sk-fp8', 't-fp8', 'smm']
 all_keys = ['p-bf16', 't-bf16', 'DSV3', 'TGV', 'fi-bf16', 'cuBLAS', 'p-fp8', 'sk-fp8', 't-fp8', 'smm']
-
 
 def bench_one(M, K, N, label=""):
     fp8_only = '[FP8]' in label
     r = {}
 
     if args.l2_pollute:
-        def nsys(kt):
-            return _bench_nsys_l2(kt, M, K, N)
-        r['p-bf16'] = nsys('p-bf16') if not fp8_only else float('nan')
-        r['p-fp8'] = nsys('p-fp8')
-        r['sk-fp8'] = nsys('sk-fp8')
-        r['t-bf16'] = nsys('t-bf16') if not fp8_only else float('nan')
-        r['t-fp8'] = nsys('t-fp8')
-        r['DSV3'] = nsys('DSV3') if (_HAS_DSV3 and K == 7168 and N == 2112
-                                      and M <= 16 and not fp8_only) else float('nan')
-        r['TGV'] = nsys('TGV') if (_HAS_TGV and N % 16 == 0
-                                    and not fp8_only) else float('nan')
-        r['fi-bf16'] = nsys('fi-bf16') if (_HAS_MM_BF16
-                                            and not fp8_only) else float('nan')
-        r['cuBLAS'] = nsys('cuBLAS') if not fp8_only else float('nan')
-        r['smm'] = nsys('smm')
+        r = _run_nsys_batch(M, K, N)
         for k in all_keys:
             if k not in r:
                 r[k] = float('nan')
         return r
 
-    # Warm-L2 mode: do_bench_cudagraph
     a = torch.randn(M, K, dtype=torch.bfloat16, device='cuda')
     b = torch.randn(N, K, dtype=torch.bfloat16, device='cuda')
     a8 = a.to(torch.float8_e4m3fn).view(torch.bfloat16)
@@ -371,7 +338,6 @@ def bench_one(M, K, N, label=""):
     s1 = torch.ones(1, device='cuda', dtype=torch.float32)
     r['smm'] = _bench(lambda: torch._scaled_mm(a_fp8, bt, scale_a=s1, scale_b=s1, out_dtype=torch.bfloat16))
     return r
-
 
 _M_vals = [int(x) for x in args.M.split(',')] if args.M else [1, 4, 8, 16]
 
