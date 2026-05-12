@@ -39,19 +39,22 @@ _compiled_cache: dict[tuple[int, bool], object] = {}
 
 
 def _get_compiled(M: int, is_fp8: bool, K: int, N: int, a_flat, b_flat, c_flat):
-    """Get or compile a kernel for the given (M, is_fp8) combination."""
+    """Get or compile a kernel for the given (M, is_fp8, K) combination."""
     import cutlass.cute as cute
     from cuda.bindings.driver import CUstream
     from cutlass.cute.runtime import from_dlpack
     from torch.cuda import current_stream
 
-    from ._ll_router_gemm_kernels import host_bf16, host_fp8
-
     key = (M, is_fp8, K)
     if key in _compiled_cache:
         return _compiled_cache[key]
 
-    host_fn = host_fp8 if is_fp8 else host_bf16
+    if is_fp8:
+        from ._ll_router_gemm_kernels import host_fp8
+        host_fn = host_fp8
+    else:
+        from ._ll_router_gemm_kernels import make_host_bf16
+        host_fn = make_host_bf16(K)
 
     a_c = from_dlpack(a_flat, assumed_align=32,
                       enable_tvm_ffi=True).mark_layout_dynamic()
@@ -64,9 +67,9 @@ def _get_compiled(M: int, is_fp8: bool, K: int, N: int, a_flat, b_flat, c_flat):
     stream = CUstream(current_stream().cuda_stream)
 
     compiled = cute.compile(host_fn, a_c, b_c, c_c, M, K_eff, N, stream,
-                            options="--enable-tvm-ffi")
+                            options="--enable-tvm-ffi --ptxas-options -maxrregcount=64")
     _compiled_cache[key] = compiled
-    logger.debug("Compiled ll_router_gemm: M=%d, is_fp8=%s", M, is_fp8)
+    logger.debug("Compiled ll_router_gemm: M=%d, is_fp8=%s, K=%d", M, is_fp8, K)
     return compiled
 
 

@@ -12,8 +12,8 @@ from vllm.platforms import current_platform
 class GateLinear(ReplicatedLinear):
     """MoE gate linear layer with four-tier GEMM dispatch:
 
-    1. cuteDSL LL router GEMM (SM90+, batch<=16, any N/K, bf16/fp8)
-    2. DSV3 specialized kernel (SM90+, batch<=16, N∈{256,384}, K=7168)
+    1. cuteDSL ll_router_gemm (SM90+, batch<=16, fp32 output)
+    2. DSV3 specialized kernel (SM90+, batch<=16, supported dims)
     3. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 + fp32 out_dtype)
     4. F.linear via ReplicatedLinear (ultimate fallback)
 
@@ -58,16 +58,13 @@ class GateLinear(ReplicatedLinear):
         )
         self.out_dtype = out_dtype
 
-        # cuteDSL LL router GEMM eligibility (SM90+, any N/K)
+        # cuteDSL ll_router_gemm eligibility 
         self.allow_ll_router_gemm = False
         if can_use_specialized_kernels:
             try:
-                from vllm.model_executor.layers.fused_moe.router.ll_router_gemm import (  # noqa: E501
-                    is_available,
-                )
-
-                self.allow_ll_router_gemm = True
-                #self.allow_ll_router_gemm = is_available()
+                from vllm.model_executor.layers.fused_moe.router.ll_router_gemm import is_available
+                self.allow_ll_router_gemm = False #is_available() #TODO(roberto): needs investigation. No improvements e2e on DSV3 (vs. ptx version).
+                                                           # can be interesting for other models that uses GateLinear directly.
             except ImportError:
                 pass
 
@@ -108,22 +105,10 @@ class GateLinear(ReplicatedLinear):
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         import vllm._custom_ops as ops
 
-        # Tier 1: cuteDSL LL router GEMM (any N/K, bf16 or fp8)
-        if (
-            self.allow_ll_router_gemm
-            and x.shape[0] <= 16
-            and x.dtype in (torch.bfloat16, torch.float8_e4m3fn)
-            and self.out_dtype == torch.float32
-        ):
-            from vllm.model_executor.layers.fused_moe.router.ll_router_gemm import (  # noqa: E501
-                ll_router_gemm,
-            )
-
-            output = ll_router_gemm(
-                hidden_states=x,
-                router_weight=self.weight,
-                output_dtype=self.out_dtype,
-            )
+        # Tier 1: cuteDSL ll_router_gemm
+        if self.allow_ll_router_gemm and x.shape[0] <= 16:
+            from vllm.model_executor.layers.fused_moe.router.ll_router_gemm import ll_router_gemm
+            output = ll_router_gemm(x, self.weight)
             return output, None
 
         # Tier 2: DSV3 specialized kernel

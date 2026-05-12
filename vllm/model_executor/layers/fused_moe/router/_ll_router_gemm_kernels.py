@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CuteDSL kernel definitions for ll_router_gemm."""
 
 import operator
 
@@ -12,10 +11,8 @@ from cutlass._mlir.dialects import arith as _arith
 from cutlass._mlir.dialects import llvm as _llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
-# ---------------------------------------------------------------------------
-# fp8 pair conversion via PTX
-# ---------------------------------------------------------------------------
 
+# ===== fp8 pair conversion via PTX =====
 
 @dsl_user_op
 def fp8x2_cvt(packed_i16, *, loc=None, ip=None):
@@ -59,146 +56,7 @@ def fp8x2_cvt(packed_i16, *, loc=None, ip=None):
     return cutlass.Float32(f32_lo), cutlass.Float32(f32_hi)
 
 
-# ---------------------------------------------------------------------------
-# bf16 kernel
-# ---------------------------------------------------------------------------
-
-
-@cute.kernel
-def dotprod_bf16(
-    gA: cute.Tensor,
-    gB: cute.Tensor,
-    gC: cute.Tensor,
-    M: cutlass.Constexpr,
-    K_dim: cutlass.Constexpr,
-    N_dim: cutlass.Int32,
-):
-    cute.arch.setmaxregister_increase(128)
-    tidx = cute.arch.thread_idx()[0]
-    n_idx = cute.arch.block_idx()[0]
-
-    VPT: cutlass.Constexpr = 16
-    BS: cutlass.Constexpr = 128
-    KPI: cutlass.Constexpr = VPT * BS
-    VPT_T: cutlass.Constexpr = 8
-    KPT: cutlass.Constexpr = VPT_T * BS
-
-    k_main = K_dim // KPI
-    k_rem = K_dim - k_main * KPI
-    k_tail = k_rem // KPT
-
-    elem = gB.element_type
-    acc = cute.make_rmem_tensor((M,), cutlass.Float32)
-    for m in cutlass.range_constexpr(M):
-        acc[m] = cutlass.Float32(0.0)
-
-    if k_main > 0:
-        kb0 = tidx * VPT
-        bp0 = (gB.iterator + (n_idx * K_dim + kb0)).align(32)
-        bt0 = cute.make_tensor(bp0, cute.make_layout((VPT,)))
-        br0 = cute.make_rmem_tensor((VPT,), elem)
-        cute.autovec_copy(bt0, br0)
-
-        cute.arch.griddepcontrol_wait()
-        
-        for m in cutlass.range_constexpr(M):
-            ap0 = (gA.iterator + (m * K_dim + kb0)).align(32)
-            at0 = cute.make_tensor(ap0, cute.make_layout((VPT,)))
-            ar0 = cute.make_rmem_tensor((VPT,), elem)
-            cute.autovec_copy(at0, ar0)
-            for v in cutlass.range_constexpr(VPT):
-                acc[m] = acc[m] + ar0[v].to(cutlass.Float32) * br0[v].to(cutlass.Float32)
-
-        for ki in cutlass.range(k_main - 1, unroll=4):
-            kb = (ki + 1) * KPI + tidx * VPT
-            bp = (gB.iterator + (n_idx * K_dim + kb)).align(32)
-            bt = cute.make_tensor(bp, cute.make_layout((VPT,)))
-            br = cute.make_rmem_tensor((VPT,), elem)
-            cute.autovec_copy(bt, br)
-            for m in cutlass.range_constexpr(M):
-                ap = (gA.iterator + (m * K_dim + kb)).align(32)
-                at = cute.make_tensor(ap, cute.make_layout((VPT,)))
-                ar = cute.make_rmem_tensor((VPT,), elem)
-                cute.autovec_copy(at, ar)
-                for v in cutlass.range_constexpr(VPT):
-                    acc[m] = acc[m] + ar[v].to(cutlass.Float32) * br[v].to(cutlass.Float32)
-    else:
-        cute.arch.griddepcontrol_wait()
-
-    # Tail: 128-bit loads
-    for ti in cutlass.range(k_tail):
-        kb = k_main * KPI + ti * KPT + tidx * VPT_T
-        bp = (gB.iterator + (n_idx * K_dim + kb)).align(16)
-        bt = cute.make_tensor(bp, cute.make_layout((VPT_T,)))
-        br = cute.make_rmem_tensor((VPT_T,), elem)
-        cute.autovec_copy(bt, br)
-        for m in cutlass.range_constexpr(M):
-            ap = (gA.iterator + (m * K_dim + kb)).align(16)
-            at = cute.make_tensor(ap, cute.make_layout((VPT_T,)))
-            ar = cute.make_rmem_tensor((VPT_T,), elem)
-            cute.autovec_copy(at, ar)
-            for v in cutlass.range_constexpr(VPT_T):
-                acc[m] = acc[m] + ar[v].to(cutlass.Float32) * br[v].to(cutlass.Float32)
-
-    # Scalar tail for non-aligned K
-    kp = k_main * KPI + k_tail * KPT
-    kr = K_dim - kp
-    ks_full = kr // BS
-    ks_part = kr - ks_full * BS
-    for si in cutlass.range(ks_full):
-        ko = kp + si * BS + tidx
-        bp = (gB.iterator + (n_idx * K_dim + ko)).align(2)
-        bt = cute.make_tensor(bp, cute.make_layout((1,)))
-        br = cute.make_rmem_tensor((1,), elem)
-        cute.autovec_copy(bt, br)
-        bv = br[0].to(cutlass.Float32)
-        for m in cutlass.range_constexpr(M):
-            ap = (gA.iterator + (m * K_dim + ko)).align(2)
-            at = cute.make_tensor(ap, cute.make_layout((1,)))
-            ar = cute.make_rmem_tensor((1,), elem)
-            cute.autovec_copy(at, ar)
-            acc[m] = acc[m] + ar[0].to(cutlass.Float32) * bv
-    if tidx < ks_part:
-        ko = kp + ks_full * BS + tidx
-        bp = (gB.iterator + (n_idx * K_dim + ko)).align(2)
-        bt = cute.make_tensor(bp, cute.make_layout((1,)))
-        br = cute.make_rmem_tensor((1,), elem)
-        cute.autovec_copy(bt, br)
-        bv = br[0].to(cutlass.Float32)
-        for m in cutlass.range_constexpr(M):
-            ap = (gA.iterator + (m * K_dim + ko)).align(2)
-            at = cute.make_tensor(ap, cute.make_layout((1,)))
-            ar = cute.make_rmem_tensor((1,), elem)
-            cute.autovec_copy(at, ar)
-            acc[m] = acc[m] + ar[0].to(cutlass.Float32) * bv
-
-    # Reduction
-    WS: cutlass.Constexpr = 32
-    NW: cutlass.Constexpr = BS // WS
-    for m in cutlass.range_constexpr(M):
-        acc[m] = cute.arch.warp_reduction(acc[m], operator.add)
-    wid = tidx // WS
-    lid = tidx % WS
-    sp = cute.arch.alloc_smem(cutlass.Float32, M * NW, alignment=16)
-    sm = cute.make_tensor(sp, cute.make_layout((M, NW)))
-    for m in cutlass.range_constexpr(M):
-        if lid == 0:
-            sm[m, wid] = acc[m]
-    cute.arch.sync_threads()
-    if tidx == 0:
-        for m in cutlass.range_constexpr(M):
-            t = cutlass.Float32(0.0)
-            for w in cutlass.range_constexpr(NW):
-                t = t + sm[m, w]
-            gC[m * N_dim + n_idx] = t.to(cutlass.Float32)
-    cute.arch.griddepcontrol_launch_dependents()
-
-
-# ---------------------------------------------------------------------------
-# fp8 kernel (receives pre-packed Int16 data)
-# ---------------------------------------------------------------------------
-
-
+# ===== fp8 kernel =====
 @cute.kernel
 def dotprod_fp8(
     gA: cute.Tensor,
@@ -235,7 +93,7 @@ def dotprod_fp8(
         br0 = cute.make_rmem_tensor((VPT,), cutlass.Int16)
         cute.autovec_copy(bt0, br0)
 
-        cute.arch.griddepcontrol_wait()
+        #cute.arch.griddepcontrol_wait()
         
         bf0 = cute.make_rmem_tensor((F_PER_T,), cutlass.Float32)
         for p in cutlass.range_constexpr(VPT):
@@ -248,7 +106,7 @@ def dotprod_fp8(
             for p in cutlass.range_constexpr(VPT):
                 a00, a10 = fp8x2_cvt(ar0[p])
                 acc[m] = acc[m] + a00 * bf0[p * 2] + a10 * bf0[p * 2 + 1]
-        
+
         for ki in cutlass.range(k_main - 1, unroll=4):
             kb = (ki + 1) * KPI + tidx * VPT
             bp = (gB.iterator + (n_idx * K_pairs + kb)).align(16)
@@ -266,10 +124,9 @@ def dotprod_fp8(
                 for p in cutlass.range_constexpr(VPT):
                     a0, a1 = fp8x2_cvt(ar[p])
                     acc[m] = acc[m] + a0 * bf[p * 2] + a1 * bf[p * 2 + 1]
-    else:
-        cute.arch.griddepcontrol_wait()
+    #else:
+    #    cute.arch.griddepcontrol_wait()
 
-    # Tail: 64-bit loads
     for ti in cutlass.range(k_tail):
         kb = k_main * KPI + ti * KPT + tidx * VPT_T
         bp = (gB.iterator + (n_idx * K_pairs + kb)).align(8)
@@ -341,31 +198,7 @@ def dotprod_fp8(
             for w in cutlass.range_constexpr(NW):
                 t = t + sm[m, w]
             gC[m * N_dim + n_idx] = t.to(cutlass.Float32)
-    cute.arch.griddepcontrol_launch_dependents()
-
-
-# ---------------------------------------------------------------------------
-# Host-side JIT wrappers
-# ---------------------------------------------------------------------------
-
-
-@cute.jit
-def host_bf16(
-    gA: cute.Tensor,
-    gB: cute.Tensor,
-    gC: cute.Tensor,
-    M: cutlass.Constexpr,
-    K_dim: cutlass.Constexpr,
-    N_dim: cutlass.Int32,
-    stream: CUstream,
-):
-    dotprod_bf16(gA, gB, gC, M, K_dim, N_dim).launch(
-        grid=[N_dim, 1, 1],
-        block=[128, 1, 1],
-        smem=M * 4 * 4,
-        stream=stream,
-        use_pdl=True,
-    )
+    #cute.arch.griddepcontrol_launch_dependents()
 
 
 @cute.jit
@@ -383,199 +216,146 @@ def host_fp8(
         block=[128, 1, 1],
         smem=M * 4 * 4,
         stream=stream,
-        use_pdl=True,
+        use_pdl=False, #TODO(roberto): needs investigation.
     )
 
 
-# ---------------------------------------------------------------------------
-# bf16 kernel with N-tiling: each CTA handles NPC experts
-# ---------------------------------------------------------------------------
+# ===== bf16 kernel =====
 
+def make_host_bf16(k_val: int):
+    """Create bf16 router kernel for a given K."""
+    _VPT = 8; _BS = 256; _KPI = _VPT * _BS       # 128-bit loads, 256 threads
+    _k_main = k_val // _KPI                      # main loop iters
+    _VPT_T = 4; _KPT = _VPT_T * _BS              # 64-bit tail loads
+    _k_tail = (k_val - _k_main * _KPI) // _KPT
+    _k_done = _k_main * _KPI + _k_tail * _KPT
+    _scalar_rem = k_val - _k_done
+    _ks_full = _scalar_rem // _BS
+    _ks_part = _scalar_rem % _BS
 
-@cute.kernel
-def dotprod_bf16_ntile(
-    gA: cute.Tensor,
-    gB: cute.Tensor,
-    gC: cute.Tensor,
-    M: cutlass.Constexpr,
-    NPC: cutlass.Constexpr,
-    K_dim: cutlass.Int32,
-    N_dim: cutlass.Int32,
-):
-    """Each CTA computes NPC expert scores, sharing A loads across experts."""
-    cute.arch.setmaxregister_increase(128)
-    tidx = cute.arch.thread_idx()[0]
-    cta_n = cute.arch.block_idx()[0]  # which N-tile
-    n_base = cta_n * NPC  # first expert in this CTA
+    @cute.kernel
+    def dotprod_bf16_lf(
+        gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor,
+        M: cutlass.Constexpr, K_dim: cutlass.Constexpr, N_dim: cutlass.Int32,
+    ):
+        cute.arch.setmaxregister_increase(128) #TODO(roberto): limit to 64?
+        tidx = cute.arch.thread_idx()[0]
+        n_idx = cute.arch.block_idx()[0]  # one CTA per expert
+        VPT: cutlass.Constexpr = _VPT
+        BS: cutlass.Constexpr = _BS
+        KPI: cutlass.Constexpr = _KPI
+        K_MAIN: cutlass.Constexpr = _k_main
+        elem = gB.element_type
+        b_base = gB.iterator + n_idx * K_dim  # precomputed B row base
+        tid_off = tidx * VPT
 
-    VPT: cutlass.Constexpr = 16
-    BS: cutlass.Constexpr = 128
-    KPI: cutlass.Constexpr = VPT * BS
-
-    k_main = K_dim // KPI
-
-    elem = gB.element_type
-    # NPC accumulators per M token
-    acc = cute.make_rmem_tensor((M, NPC), cutlass.Float32)
-    for m in cutlass.range_constexpr(M):
-        for nc in cutlass.range_constexpr(NPC):
-            acc[m, nc] = cutlass.Float32(0.0)
-
-    # B registers for NPC experts
-    br_all = cute.make_rmem_tensor((NPC, VPT), elem)
-
-    if k_main > 0:
-        kb0 = tidx * VPT
-
-        # Prefetch B for all NPC experts
-        for nc in cutlass.range_constexpr(NPC):
-            bp = (gB.iterator + ((n_base + nc) * K_dim + kb0)).align(32)
-            bt = cute.make_tensor(bp, cute.make_layout((VPT,)))
-            br_nc = cute.make_rmem_tensor((VPT,), elem)
-            cute.autovec_copy(bt, br_nc)
-            for v in cutlass.range_constexpr(VPT):
-                br_all[nc, v] = br_nc[v]
-
-        cute.arch.griddepcontrol_wait()
-
-        # Load A ONCE, accumulate for all NPC experts
+        acc = cute.make_rmem_tensor((M,), cutlass.Float32)
         for m in cutlass.range_constexpr(M):
-            ap = (gA.iterator + (m * K_dim + kb0)).align(32)
-            at = cute.make_tensor(ap, cute.make_layout((VPT,)))
-            ar = cute.make_rmem_tensor((VPT,), elem)
-            cute.autovec_copy(at, ar)
-            for v in cutlass.range_constexpr(VPT):
-                av = ar[v].to(cutlass.Float32)
-                for nc in cutlass.range_constexpr(NPC):
-                    acc[m, nc] = acc[m, nc] + av * br_all[nc, v].to(cutlass.Float32)
+            acc[m] = cutlass.Float32(0.0)
 
-        for ki in cutlass.range(k_main - 1, unroll=4):
-            kb = (ki + 1) * KPI + tidx * VPT
-            for nc in cutlass.range_constexpr(NPC):
-                bp = (gB.iterator + ((n_base + nc) * K_dim + kb)).align(32)
-                bt = cute.make_tensor(bp, cute.make_layout((VPT,)))
-                br_nc = cute.make_rmem_tensor((VPT,), elem)
-                cute.autovec_copy(bt, br_nc)
-                for v in cutlass.range_constexpr(VPT):
-                    br_all[nc, v] = br_nc[v]
+        # Main K-loop (fully unrolled via range_constexpr)
+        for ki in cutlass.range_constexpr(K_MAIN):
+            kb = ki * KPI + tid_off
+            # Load B tile
+            bp = (b_base + kb).align(16)
+            bt = cute.make_tensor(bp, cute.make_layout((VPT,)))
+            br = cute.make_rmem_tensor((VPT,), elem)
+            cute.autovec_copy(bt, br)
+            # Batch-load all A tokens into registers
+            ar_all = cute.make_rmem_tensor((M, VPT), elem)
             for m in cutlass.range_constexpr(M):
-                ap = (gA.iterator + (m * K_dim + kb)).align(32)
+                ap = (gA.iterator + (m * K_dim + kb)).align(16)
                 at = cute.make_tensor(ap, cute.make_layout((VPT,)))
                 ar = cute.make_rmem_tensor((VPT,), elem)
                 cute.autovec_copy(at, ar)
                 for v in cutlass.range_constexpr(VPT):
-                    av = ar[v].to(cutlass.Float32)
-                    for nc in cutlass.range_constexpr(NPC):
-                        acc[m, nc] = acc[m, nc] + av * br_all[nc, v].to(cutlass.Float32)
-    else:
-        cute.arch.griddepcontrol_wait()
+                    ar_all[m, v] = ar[v]
+            # Compute (all data in registers)
+            for m in cutlass.range_constexpr(M):
+                for v in cutlass.range_constexpr(VPT):
+                    acc[m] = acc[m] + ar_all[m, v].to(cutlass.Float32) * br[v].to(cutlass.Float32)
 
-    # Tail handling: scalar per-element (simplified — skip for K%KPI==0 shapes)
-    k_rem = K_dim - k_main * KPI
-    VPT_T: cutlass.Constexpr = 8
-    KPT: cutlass.Constexpr = VPT_T * BS
-    k_tail = k_rem // KPT
-    for ti in cutlass.range(k_tail):
-        kb = k_main * KPI + ti * KPT + tidx * VPT_T
-        br_t = cute.make_rmem_tensor((NPC, VPT_T), elem)
-        for nc in cutlass.range_constexpr(NPC):
-            bp = (gB.iterator + ((n_base + nc) * K_dim + kb)).align(16)
+        VPT_T: cutlass.Constexpr = _VPT_T
+        KPT: cutlass.Constexpr = _KPT
+        K_DONE: cutlass.Constexpr = _k_main * _KPI
+        tid_off_t = tidx * VPT_T
+        # Vectorized tail (64-bit loads for K remainder)
+        for ti in cutlass.range_constexpr(_k_tail):
+            kb = K_DONE + ti * KPT + tid_off_t
+            bp = (b_base + kb).align(8)
             bt = cute.make_tensor(bp, cute.make_layout((VPT_T,)))
-            br_nc = cute.make_rmem_tensor((VPT_T,), elem)
-            cute.autovec_copy(bt, br_nc)
-            for v in cutlass.range_constexpr(VPT_T):
-                br_t[nc, v] = br_nc[v]
-        for m in cutlass.range_constexpr(M):
-            ap = (gA.iterator + (m * K_dim + kb)).align(16)
-            at = cute.make_tensor(ap, cute.make_layout((VPT_T,)))
-            ar = cute.make_rmem_tensor((VPT_T,), elem)
-            cute.autovec_copy(at, ar)
-            for v in cutlass.range_constexpr(VPT_T):
-                av = ar[v].to(cutlass.Float32)
-                for nc in cutlass.range_constexpr(NPC):
-                    acc[m, nc] = acc[m, nc] + av * br_t[nc, v].to(cutlass.Float32)
+            br = cute.make_rmem_tensor((VPT_T,), elem)
+            cute.autovec_copy(bt, br)
+            for m in cutlass.range_constexpr(M):
+                ap = (gA.iterator + (m * K_dim + kb)).align(8)
+                at = cute.make_tensor(ap, cute.make_layout((VPT_T,)))
+                ar = cute.make_rmem_tensor((VPT_T,), elem)
+                cute.autovec_copy(at, ar)
+                for v in cutlass.range_constexpr(VPT_T):
+                    acc[m] = acc[m] + ar[v].to(cutlass.Float32) * br[v].to(cutlass.Float32)
 
-    # Scalar tail
-    kp = k_main * KPI + k_tail * KPT
-    kr = K_dim - kp
-    ks_full = kr // BS
-    ks_part = kr - ks_full * BS
-    for si in cutlass.range(ks_full):
-        ko = kp + si * BS + tidx
-        bv_all = cute.make_rmem_tensor((NPC,), cutlass.Float32)
-        for nc in cutlass.range_constexpr(NPC):
-            bp = (gB.iterator + ((n_base + nc) * K_dim + ko)).align(2)
+        # Scalar tail (one element per thread for non-aligned K)
+        K_DONE_ALL: cutlass.Constexpr = _k_done
+        for si in cutlass.range_constexpr(_ks_full):
+            ko = K_DONE_ALL + si * BS + tidx
+            bp = (b_base + ko).align(2)
             bt = cute.make_tensor(bp, cute.make_layout((1,)))
             br = cute.make_rmem_tensor((1,), elem)
             cute.autovec_copy(bt, br)
-            bv_all[nc] = br[0].to(cutlass.Float32)
-        for m in cutlass.range_constexpr(M):
-            ap = (gA.iterator + (m * K_dim + ko)).align(2)
-            at = cute.make_tensor(ap, cute.make_layout((1,)))
-            ar = cute.make_rmem_tensor((1,), elem)
-            cute.autovec_copy(at, ar)
-            av = ar[0].to(cutlass.Float32)
-            for nc in cutlass.range_constexpr(NPC):
-                acc[m, nc] = acc[m, nc] + av * bv_all[nc]
-    if tidx < ks_part:
-        ko = kp + ks_full * BS + tidx
-        bv_all2 = cute.make_rmem_tensor((NPC,), cutlass.Float32)
-        for nc in cutlass.range_constexpr(NPC):
-            bp = (gB.iterator + ((n_base + nc) * K_dim + ko)).align(2)
-            bt = cute.make_tensor(bp, cute.make_layout((1,)))
-            br = cute.make_rmem_tensor((1,), elem)
-            cute.autovec_copy(bt, br)
-            bv_all2[nc] = br[0].to(cutlass.Float32)
-        for m in cutlass.range_constexpr(M):
-            ap = (gA.iterator + (m * K_dim + ko)).align(2)
-            at = cute.make_tensor(ap, cute.make_layout((1,)))
-            ar = cute.make_rmem_tensor((1,), elem)
-            cute.autovec_copy(at, ar)
-            av = ar[0].to(cutlass.Float32)
-            for nc in cutlass.range_constexpr(NPC):
-                acc[m, nc] = acc[m, nc] + av * bv_all2[nc]
+            bv = br[0].to(cutlass.Float32)
+            for m in cutlass.range_constexpr(M):
+                ap = (gA.iterator + (m * K_dim + ko)).align(2)
+                at = cute.make_tensor(ap, cute.make_layout((1,)))
+                ar = cute.make_rmem_tensor((1,), elem)
+                cute.autovec_copy(at, ar)
+                acc[m] = acc[m] + ar[0].to(cutlass.Float32) * bv
 
-    # Reduction: per-expert warp reduction + smem reduction
-    WS: cutlass.Constexpr = 32
-    NW: cutlass.Constexpr = BS // WS
-    for m in cutlass.range_constexpr(M):
-        for nc in cutlass.range_constexpr(NPC):
-            acc[m, nc] = cute.arch.warp_reduction(acc[m, nc], operator.add)
-    wid = tidx // WS
-    lid = tidx % WS
-    sp = cute.arch.alloc_smem(cutlass.Float32, M * NPC * NW, alignment=16)
-    sm = cute.make_tensor(sp, cute.make_layout((M, NPC, NW)))
-    for m in cutlass.range_constexpr(M):
-        for nc in cutlass.range_constexpr(NPC):
+        if _ks_part > 0:
+            KS_PART: cutlass.Constexpr = _ks_part
+            ko_p = K_DONE_ALL + _ks_full * BS + tidx
+            if tidx < KS_PART:
+                bp2 = (b_base + ko_p).align(2)
+                bt2 = cute.make_tensor(bp2, cute.make_layout((1,)))
+                br2 = cute.make_rmem_tensor((1,), elem)
+                cute.autovec_copy(bt2, br2)
+                bv2 = br2[0].to(cutlass.Float32)
+                for m in cutlass.range_constexpr(M):
+                    ap2 = (gA.iterator + (m * K_dim + ko_p)).align(2)
+                    at2 = cute.make_tensor(ap2, cute.make_layout((1,)))
+                    ar2 = cute.make_rmem_tensor((1,), elem)
+                    cute.autovec_copy(at2, ar2)
+                    acc[m] = acc[m] + ar2[0].to(cutlass.Float32) * bv2
+
+        # Warp + cross-warp reduction
+        WS: cutlass.Constexpr = 32
+        NW: cutlass.Constexpr = BS // WS
+        for m in cutlass.range_constexpr(M):
+            acc[m] = cute.arch.warp_reduction(acc[m], operator.add)
+        wid = tidx // WS
+        lid = tidx % WS
+        sp = cute.arch.alloc_smem(cutlass.Float32, M * NW, alignment=16)
+        sm = cute.make_tensor(sp, cute.make_layout((M, NW)))
+        for m in cutlass.range_constexpr(M):
             if lid == 0:
-                sm[m, nc, wid] = acc[m, nc]
-    cute.arch.sync_threads()
-    if tidx == 0:
-        for m in cutlass.range_constexpr(M):
-            for nc in cutlass.range_constexpr(NPC):
+                sm[m, wid] = acc[m]
+        cute.arch.sync_threads()
+        if tidx == 0:
+            for m in cutlass.range_constexpr(M):
                 t = cutlass.Float32(0.0)
                 for w in cutlass.range_constexpr(NW):
-                    t = t + sm[m, nc, w]
-                gC[m * N_dim + n_base + nc] = t.to(cutlass.Float32)
-    cute.arch.griddepcontrol_launch_dependents()
+                    t = t + sm[m, w]
+                gC[m * N_dim + n_idx] = t.to(cutlass.Float32)
 
+    @cute.jit
+    def host_bf16_lf(
+        gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor,
+        M: cutlass.Constexpr, K_dim: cutlass.Constexpr,
+        N_dim: cutlass.Int32, stream: CUstream,
+    ):
+        dotprod_bf16_lf(gA, gB, gC, M, K_dim, N_dim).launch(
+            grid=[N_dim, 1, 1], block=[256, 1, 1],
+            smem=M * 4 * 8, stream=stream, 
+            use_pdl=False, #TODO(roberto): needs investigation.
+        )
 
-@cute.jit
-def host_bf16_ntile(
-    gA: cute.Tensor,
-    gB: cute.Tensor,
-    gC: cute.Tensor,
-    M: cutlass.Constexpr,
-    NPC: cutlass.Constexpr,
-    K_dim: cutlass.Int32,
-    N_dim: cutlass.Int32,
-    stream: CUstream,
-):
-    grid_n = (N_dim + NPC - 1) // NPC
-    dotprod_bf16_ntile(gA, gB, gC, M, NPC, K_dim, N_dim).launch(
-        grid=[grid_n, 1, 1],
-        block=[128, 1, 1],
-        smem=M * NPC * 4 * 4,
-        stream=stream,
-        use_pdl=True,
-    )
+    return host_bf16_lf
