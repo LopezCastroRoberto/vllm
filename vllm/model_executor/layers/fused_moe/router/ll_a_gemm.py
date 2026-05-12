@@ -152,14 +152,6 @@ def ll_a_gemm_fp8(
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
 ) -> torch.Tensor:
-    """FP8 per-tensor low-latency GEMM with adaptive split-K.
-
-    Args:
-        hidden_states: [M, K] bfloat16 input activations
-        weight_fp8_viewed: [N, K/2] bf16-viewed FP8 weight (pre-cached)
-        input_scale: float32 per-tensor input scale
-        weight_scale: float32 per-tensor weight scale
-    """
     from cuda.bindings.driver import CUstream
     from torch.cuda import current_stream
 
@@ -180,6 +172,7 @@ def ll_a_gemm_fp8(
     K_view = w8.shape[1]
 
     # Select split_k
+    #TODO(roberto): Implement an autotuner.
     tiles = K_view // 256
     if tiles >= 12 and N <= 256:
         split_k = 12
