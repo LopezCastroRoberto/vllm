@@ -18,8 +18,8 @@ def is_available() -> bool:
         return False
 
 
-
 _splitk_cache: dict = {}
+
 
 def _get_compiled_splitk(a, b, c, split_k: int, num_stages: int = 0):
     """Compile split-K kernel variant."""
@@ -38,9 +38,6 @@ def _get_compiled_splitk(a, b, c, split_k: int, num_stages: int = 0):
         return _splitk_cache[cache_key]
 
     div = 8
-    b_div = div
-    c_div = div
-    tn = 16
 
     mA = (from_dlpack(a, assumed_align=16, enable_tvm_ffi=True)
           .mark_layout_dynamic(leading_dim=1)
@@ -49,20 +46,17 @@ def _get_compiled_splitk(a, b, c, split_k: int, num_stages: int = 0):
     mB = (from_dlpack(b, assumed_align=16, enable_tvm_ffi=True)
           .mark_layout_dynamic(leading_dim=1)
           .mark_compact_shape_dynamic(mode=1, stride_order=(0, 1),
-                                      divisibility=b_div))
+                                      divisibility=div))
     mC = (from_dlpack(c, assumed_align=16, enable_tvm_ffi=True)
           .mark_layout_dynamic(leading_dim=1)
           .mark_compact_shape_dynamic(mode=1, stride_order=(0, 1),
-                                      divisibility=c_div))
+                                      divisibility=div))
 
-    gemm = LLAGemm(tile_n=tn, tile_k=256, num_stages=ns,
-                    num_dma_warps=4, split_k=split_k,
-                    transpose_output=False)
+    gemm = LLAGemm(tile_n=16, tile_k=256, num_stages=ns,
+                    num_dma_warps=4, split_k=split_k)
     stream = CUstream(current_stream().cuda_stream)
     compiled = cute.compile(gemm.call_splitk, mA, mB, mC, stream,
                             options="--enable-tvm-ffi")
     _splitk_cache[cache_key] = compiled
-    logger.debug("Compiled ll_a_gemm splitk: sk=%d ns=%d ",
-                 split_k, ns)
+    logger.debug("Compiled ll_a_gemm splitk: sk=%d ns=%d", split_k, ns)
     return compiled
-
