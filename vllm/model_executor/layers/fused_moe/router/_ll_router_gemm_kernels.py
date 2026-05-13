@@ -8,7 +8,8 @@ from cuda.bindings.driver import CUstream
 
 def make_host_bf16(k_val: int):
     """Create bf16 router kernel for a given K."""
-    _VPT = 8; _BS = 256; _KPI = _VPT * _BS       # 128-bit loads, 256 threads
+    _VPT = 8
+    _BS = 256; _KPI = _VPT * _BS       # 128-bit loads, 256 threads
     _k_main = k_val // _KPI                      # main loop iters
     _VPT_T = 4; _KPT = _VPT_T * _BS              # 64-bit tail loads
     _k_tail = (k_val - _k_main * _KPI) // _KPT

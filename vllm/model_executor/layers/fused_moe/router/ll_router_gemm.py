@@ -72,15 +72,21 @@ def ll_router_gemm(
 
     M, K = hidden_states.shape
     N = router_weight.shape[0]
+    stream = CUstream(current_stream().cuda_stream)
     output = torch.empty(M, N, dtype=output_dtype, device=hidden_states.device)
 
-    a_flat = hidden_states.reshape(-1)
-    b_flat = router_weight.reshape(-1)
-    c_flat = output.reshape(-1)
-
-    compiled = _get_compiled(M, K, N, a_flat, b_flat, c_flat)
-    
-    stream = CUstream(current_stream().cuda_stream)
-    compiled(a_flat, b_flat, c_flat, N, stream)
+    if M >= 4 and K >= 8192:
+        from .ll_a_gemm import _get_compiled_splitk
+        compiled = _get_compiled_splitk(
+            False, False, hidden_states, router_weight, output,
+            split_k=6, num_stages=2,
+        )
+        compiled(hidden_states, router_weight, output, stream, 1.0)
+    else:
+        a_flat = hidden_states.reshape(-1)
+        b_flat = router_weight.reshape(-1)
+        c_flat = output.reshape(-1)
+        compiled = _get_compiled(M, K, N, a_flat, b_flat, c_flat)
+        compiled(a_flat, b_flat, c_flat, N, stream)
 
     return output
