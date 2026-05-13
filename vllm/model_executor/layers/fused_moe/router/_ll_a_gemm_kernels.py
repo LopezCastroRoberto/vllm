@@ -73,6 +73,7 @@ class LLAGemm:
         num_dma_warps: int = 4,
         split_k: int = 1,
         transpose_output: bool = False,
+        *, loc=None, ip=None,
     ):
         self.ab_dtype = ab_dtype
         self.acc_dtype = acc_dtype
