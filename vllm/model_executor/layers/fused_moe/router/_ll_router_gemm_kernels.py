@@ -37,6 +37,8 @@ def make_host_bf16(k_val: int):
         for m in cutlass.range_constexpr(M):
             acc[m] = cutlass.Float32(0.0)
 
+        cute.arch.griddepcontrol_wait()
+
         # Main K-loop (fully unrolled via range_constexpr)
         for ki in cutlass.range_constexpr(K_MAIN):
             kb = ki * KPI + tid_off
@@ -129,6 +131,7 @@ def make_host_bf16(k_val: int):
                 for w in cutlass.range_constexpr(NW):
                     t = t + sm[m, w]
                 gC[m * N_dim + n_idx] = t.to(cutlass.Float32)
+        cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
     def host_bf16_lf(
@@ -139,7 +142,7 @@ def make_host_bf16(k_val: int):
         dotprod_bf16_lf(gA, gB, gC, M, K_dim, N_dim).launch(
             grid=[N_dim, 1, 1], block=[256, 1, 1],
             smem=M * 4 * 8, stream=stream, 
-            use_pdl=False, #TODO(roberto): needs investigation.
+            use_pdl=True,
         )
 
     return host_bf16_lf
