@@ -10,10 +10,10 @@ from vllm.platforms import current_platform
 
 @PluggableLayer.register("gate_linear")
 class GateLinear(ReplicatedLinear):
-    """MoE gate linear layer with three-tier GEMM dispatch:
+    """MoE gate linear layer with four-tier GEMM dispatch:
 
     1. DSV3 specialized kernel (SM90+, batch<=16, supported dims)
-    2. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 + fp32 out_dtype)
+    2. cuBLAS bf16xbf16→fp32 (SM90+ + bf16 + fp32 out_dtype)
     3. F.linear via ReplicatedLinear (ultimate fallback)
 
     The ``out_dtype`` attribute is mutable and can be set after init
@@ -43,7 +43,7 @@ class GateLinear(ReplicatedLinear):
         )
 
         # If fp32 compute is required and no specialized kernel is available,
-        # store weights in fp32 so Tier 3 computes in fp32 natively.
+        # store weights in fp32 so Tier 4 computes in fp32 natively.
         if force_fp32_compute and not can_use_specialized_kernels:
             params_dtype = torch.float32
 
@@ -71,6 +71,15 @@ class GateLinear(ReplicatedLinear):
             and self.weight.dtype == torch.bfloat16
             and self.out_dtype == torch.float32
         )
+
+        # cuteDSL ll_router_gemm eligibility (SM90+, any dims)
+        self.allow_ll_router_gemm = False
+        if can_use_specialized_kernels:
+            try:
+                from vllm.model_executor.layers.fused_moe.router.ll_router_gemm import is_available
+                self.allow_ll_router_gemm = is_available()
+            except ImportError:
+                pass
 
     def set_out_dtype(self, out_dtype: torch.dtype) -> None:
         """Set output dtype for the router logits after init.
@@ -102,13 +111,19 @@ class GateLinear(ReplicatedLinear):
                 output_dtype=self.out_dtype,
             )
             return output, None
+        
+        # Tier 2: cuteDSL ll_router_gemm (SM90+, fp32 output)
+        if self.allow_ll_router_gemm and x.shape[0] <= 16:
+            from vllm.model_executor.layers.fused_moe.router.ll_router_gemm import ll_router_gemm
+            output = ll_router_gemm(x, self.weight)
+            return output, None
 
-        # Tier 2: cuBLAS bf16→fp32
+        # Tier 3: cuBLAS bf16→fp32
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
             output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
             return output, None
 
-        # Tier 3: F.linear (ReplicatedLinear)
+        # Tier 4: F.linear (ReplicatedLinear)
         if self.out_dtype is not None and x.dtype != self.weight.dtype:
             x = x.to(self.weight.dtype)
         output, output_bias = super().forward(x)
