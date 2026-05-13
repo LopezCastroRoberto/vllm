@@ -27,12 +27,12 @@ def is_available() -> bool:
     return _cutedsl_available
 
 
-# Cache: (M, is_fp8) -> compiled callable
+# Cache: (M, K) -> compiled callable
 _compiled_cache: dict[tuple[int, bool], object] = {}
 
 
 def _get_compiled(M: int, K: int, N: int, a_flat, b_flat, c_flat):
-    """Get or compile a kernel for the given (M, is_fp8, K) combination."""
+    """Get or compile a dot-product kernel for the given (M, K) combination."""
     import cutlass.cute as cute
     from cuda.bindings.driver import CUstream
     from cutlass.cute.runtime import from_dlpack
@@ -78,7 +78,7 @@ def ll_router_gemm(
     if M >= 4 and K >= 8192:
         from .ll_a_gemm import _get_compiled_splitk
         compiled = _get_compiled_splitk(
-            False, False, hidden_states, router_weight, output,
+            hidden_states, router_weight, output,
             split_k=6, num_stages=2,
         )
         compiled(hidden_states, router_weight, output, stream, 1.0)
