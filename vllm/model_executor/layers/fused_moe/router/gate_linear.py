@@ -12,9 +12,10 @@ from vllm.platforms import current_platform
 class GateLinear(ReplicatedLinear):
     """MoE gate linear layer with four-tier GEMM dispatch:
 
-    1. DSV3 specialized kernel (SM90+, batch<=16, supported dims)
-    2. cuBLAS bf16xbf16→fp32 (SM90+ + bf16 + fp32 out_dtype)
-    3. F.linear via ReplicatedLinear (ultimate fallback)
+    1. cuteDSL ll_router_gemm (SM90+, batch<=16, any dims)
+    2. DSV3 specialized kernel (SM90+, batch<=16, supported dims only)
+    3. cuBLAS bf16xbf16→fp32 (SM90+ + bf16 + fp32 out_dtype)
+    4. F.linear via ReplicatedLinear (ultimate fallback)
 
     The ``out_dtype`` attribute is mutable and can be set after init
     (e.g. when the required dtype depends on the expert quantization
@@ -103,19 +104,19 @@ class GateLinear(ReplicatedLinear):
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         import vllm._custom_ops as ops
 
-        # Tier 1: DSV3 specialized kernel
+        # Tier 1: cuteDSL ll_router_gemm (SM90+, any dims)
+        if self.allow_ll_router_gemm and x.shape[0] <= 16:
+            from vllm.model_executor.layers.fused_moe.router.ll_router_gemm import ll_router_gemm
+            output = ll_router_gemm(x, self.weight)
+            return output, None
+
+        # Tier 2: DSV3 specialized kernel (fallback for when cuteDSL unavailable)
         if self.allow_dsv3_router_gemm and x.shape[0] <= 16:
             output = ops.dsv3_router_gemm(
                 hidden_states=x,
                 router_weight=self.weight,
                 output_dtype=self.out_dtype,
             )
-            return output, None
-        
-        # Tier 2: cuteDSL ll_router_gemm (SM90+, fp32 output)
-        if self.allow_ll_router_gemm and x.shape[0] <= 16:
-            from vllm.model_executor.layers.fused_moe.router.ll_router_gemm import ll_router_gemm
-            output = ll_router_gemm(x, self.weight)
             return output, None
 
         # Tier 3: cuBLAS bf16→fp32
