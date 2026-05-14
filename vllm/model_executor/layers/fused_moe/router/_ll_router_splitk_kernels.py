@@ -21,7 +21,7 @@ from cutlass.pipeline import sm90 as pipeline
 def cluster_arrive_relaxed(*, loc=None, ip=None):
     i32 = _ir.IntegerType.get_signless(32)
     _llvm.inline_asm(i32, [],
-        "barrier.cluster.arrive.aligned; mov.u32 $0, 0;",
+        "barrier.cluster.arrive; mov.u32 $0, 0;",
         "=r", has_side_effects=True, loc=loc, ip=ip)
 
 
@@ -29,7 +29,7 @@ def cluster_arrive_relaxed(*, loc=None, ip=None):
 def cluster_wait(*, loc=None, ip=None):
     i32 = _ir.IntegerType.get_signless(32)
     _llvm.inline_asm(i32, [],
-        "barrier.cluster.wait.aligned; mov.u32 $0, 0;",
+        "barrier.cluster.wait; mov.u32 $0, 0;",
         "=r", has_side_effects=True, loc=loc, ip=ip)
 
 
