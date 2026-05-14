@@ -75,8 +75,8 @@ def ll_router_gemm(
     stream = CUstream(current_stream().cuda_stream)
     output = torch.empty(M, N, dtype=output_dtype, device=hidden_states.device)
 
-    if M > 4 and K >= 8192:
-        from .ll_a_gemm import _get_compiled_splitk
+    if M > 4 and K >= 2048:
+        from .ll_router_splitk import _get_compiled_splitk
         compiled = _get_compiled_splitk(
             hidden_states, router_weight, output,
             split_k=8, num_stages=2,

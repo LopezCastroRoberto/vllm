@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""CuteDSL split-K A GEMM: C[M,N] = A[M,K] @ B[N,K]^T.
+
+Warp-specialized kernel with cluster split-K reduction for low-latency
+router GEMM on tall-K, narrow-M problems (e.g. K=14400, N=256, M<=16).
+"""
 
 import math
 
@@ -51,7 +56,7 @@ def st_shared_remote_f32(remote_addr, val, *, loc=None, ip=None):
 
 
 @dsl_user_op
-class LLAGemm:
+class LLRouterSplitK:
     """Warp-specialized low-latency A GEMM with cluster split-K reduction."""
 
     def __init__(

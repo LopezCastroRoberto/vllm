@@ -28,7 +28,7 @@ def _get_compiled_splitk(a, b, c, split_k: int, num_stages: int = 0):
     from cutlass.cute.runtime import from_dlpack
     from torch.cuda import current_stream
 
-    from ._ll_a_gemm_kernels import LLAGemm
+    from ._ll_router_splitk_kernels import LLRouterSplitK
 
     K = a.shape[1]
     tiles = K // 256
@@ -52,11 +52,11 @@ def _get_compiled_splitk(a, b, c, split_k: int, num_stages: int = 0):
           .mark_compact_shape_dynamic(mode=1, stride_order=(0, 1),
                                       divisibility=div))
 
-    gemm = LLAGemm(tile_n=16, tile_k=256, num_stages=ns,
+    gemm = LLRouterSplitK(tile_n=16, tile_k=256, num_stages=ns,
                     num_dma_warps=4, split_k=split_k)
     stream = CUstream(current_stream().cuda_stream)
     compiled = cute.compile(gemm.call_splitk, mA, mB, mC, stream,
                             options="--enable-tvm-ffi")
     _splitk_cache[cache_key] = compiled
-    logger.debug("Compiled ll_a_gemm splitk: sk=%d ns=%d", split_k, ns)
+    logger.debug("Compiled ll_router_splitk: sk=%d ns=%d", split_k, ns)
     return compiled
