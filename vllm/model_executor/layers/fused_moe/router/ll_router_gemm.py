@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 _cutedsl_available: bool | None = None
 
+
 def is_available() -> bool:
     """Check if cuteDSL backend is available."""
     global _cutedsl_available
@@ -28,7 +29,7 @@ def is_available() -> bool:
 
 
 # Cache: (M, K) -> compiled callable
-_compiled_cache: dict[tuple[int, bool], object] = {}
+_compiled_cache: dict[tuple[int, int], object] = {}
 
 
 def _get_compiled(M: int, K: int, N: int, a_flat, b_flat, c_flat):
@@ -43,20 +44,33 @@ def _get_compiled(M: int, K: int, N: int, a_flat, b_flat, c_flat):
         return _compiled_cache[key]
 
     from ._ll_router_gemm_kernels import make_host_bf16
+
     host_fn = make_host_bf16(K)
 
-    a_c = from_dlpack(a_flat, assumed_align=32,
-                      enable_tvm_ffi=True).mark_layout_dynamic()
-    b_c = from_dlpack(b_flat, assumed_align=32,
-                      enable_tvm_ffi=True).mark_layout_dynamic()
-    c_c = from_dlpack(c_flat, assumed_align=32,
-                      enable_tvm_ffi=True).mark_layout_dynamic()
+    a_c = from_dlpack(
+        a_flat, assumed_align=32, enable_tvm_ffi=True
+    ).mark_layout_dynamic()
+    b_c = from_dlpack(
+        b_flat, assumed_align=32, enable_tvm_ffi=True
+    ).mark_layout_dynamic()
+    c_c = from_dlpack(
+        c_flat, assumed_align=32, enable_tvm_ffi=True
+    ).mark_layout_dynamic()
 
     K_eff = K
     stream = CUstream(current_stream().cuda_stream)
 
-    compiled = cute.compile(host_fn, a_c, b_c, c_c, M, K_eff, N, stream,
-                            options="--enable-tvm-ffi --ptxas-options -maxrregcount=64")
+    compiled = cute.compile(
+        host_fn,
+        a_c,
+        b_c,
+        c_c,
+        M,
+        K_eff,
+        N,
+        stream,
+        options="--enable-tvm-ffi --ptxas-options -maxrregcount=64",
+    )
     _compiled_cache[key] = compiled
     logger.debug("Compiled ll_router_gemm: M=%d, K=%d", M, K)
     return compiled
@@ -77,9 +91,13 @@ def ll_router_gemm(
 
     if M > 4 and K >= 2048:
         from .ll_router_splitk import _get_compiled_splitk
+
         compiled = _get_compiled_splitk(
-            hidden_states, router_weight, output,
-            split_k=8, num_stages=2,
+            hidden_states,
+            router_weight,
+            output,
+            split_k=8,
+            num_stages=2,
         )
         compiled(hidden_states, router_weight, output, stream, 1.0)
     else:

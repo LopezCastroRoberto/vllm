@@ -5,14 +5,13 @@ from __future__ import annotations
 
 import logging
 
-import torch
-
 logger = logging.getLogger(__name__)
 
 
 def is_available() -> bool:
     try:
         import cutlass.cute  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -39,24 +38,29 @@ def _get_compiled_splitk(a, b, c, split_k: int, num_stages: int = 0):
 
     div = 8
 
-    mA = (from_dlpack(a, assumed_align=16, enable_tvm_ffi=True)
-          .mark_layout_dynamic(leading_dim=1)
-          .mark_compact_shape_dynamic(mode=1, stride_order=(0, 1),
-                                      divisibility=div))
-    mB = (from_dlpack(b, assumed_align=16, enable_tvm_ffi=True)
-          .mark_layout_dynamic(leading_dim=1)
-          .mark_compact_shape_dynamic(mode=1, stride_order=(0, 1),
-                                      divisibility=div))
-    mC = (from_dlpack(c, assumed_align=16, enable_tvm_ffi=True)
-          .mark_layout_dynamic(leading_dim=1)
-          .mark_compact_shape_dynamic(mode=1, stride_order=(0, 1),
-                                      divisibility=div))
+    mA = (
+        from_dlpack(a, assumed_align=16, enable_tvm_ffi=True)
+        .mark_layout_dynamic(leading_dim=1)
+        .mark_compact_shape_dynamic(mode=1, stride_order=(0, 1), divisibility=div)
+    )
+    mB = (
+        from_dlpack(b, assumed_align=16, enable_tvm_ffi=True)
+        .mark_layout_dynamic(leading_dim=1)
+        .mark_compact_shape_dynamic(mode=1, stride_order=(0, 1), divisibility=div)
+    )
+    mC = (
+        from_dlpack(c, assumed_align=16, enable_tvm_ffi=True)
+        .mark_layout_dynamic(leading_dim=1)
+        .mark_compact_shape_dynamic(mode=1, stride_order=(0, 1), divisibility=div)
+    )
 
-    gemm = LLRouterSplitK(tile_n=16, tile_k=256, num_stages=ns,
-                    num_dma_warps=4, split_k=split_k)
+    gemm = LLRouterSplitK(
+        tile_n=16, tile_k=256, num_stages=ns, num_dma_warps=4, split_k=split_k
+    )
     stream = CUstream(current_stream().cuda_stream)
-    compiled = cute.compile(gemm.call_splitk, mA, mB, mC, stream,
-                            options="--enable-tvm-ffi")
+    compiled = cute.compile(
+        gemm.call_splitk, mA, mB, mC, stream, options="--enable-tvm-ffi"
+    )
     _splitk_cache[cache_key] = compiled
     logger.debug("Compiled ll_router_splitk: sk=%d ns=%d", split_k, ns)
     return compiled

@@ -77,7 +77,10 @@ class GateLinear(ReplicatedLinear):
         self.allow_ll_router_gemm = False
         if can_use_specialized_kernels:
             try:
-                from vllm.model_executor.layers.fused_moe.router.ll_router_gemm import is_available
+                from vllm.model_executor.layers.fused_moe.router.ll_router_gemm import (
+                    is_available,
+                )
+
                 self.allow_ll_router_gemm = is_available()
             except ImportError:
                 pass
@@ -106,7 +109,10 @@ class GateLinear(ReplicatedLinear):
 
         # Tier 1: cuteDSL ll_router_gemm (SM90+, any dims)
         if self.allow_ll_router_gemm and x.shape[0] <= 16:
-            from vllm.model_executor.layers.fused_moe.router.ll_router_gemm import ll_router_gemm
+            from vllm.model_executor.layers.fused_moe.router.ll_router_gemm import (
+                ll_router_gemm,
+            )
+
             output = ll_router_gemm(x, self.weight)
             return output, None
 

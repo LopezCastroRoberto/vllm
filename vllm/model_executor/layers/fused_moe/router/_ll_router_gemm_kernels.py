@@ -6,12 +6,15 @@ import cutlass
 import cutlass.cute as cute
 from cuda.bindings.driver import CUstream
 
+
 def make_host_bf16(k_val: int):
     """Create bf16 router kernel for a given K."""
     _VPT = 8
-    _BS = 256; _KPI = _VPT * _BS       # 128-bit loads, 256 threads
-    _k_main = k_val // _KPI                      # main loop iters
-    _VPT_T = 4; _KPT = _VPT_T * _BS              # 64-bit tail loads
+    _BS = 256
+    _KPI = _VPT * _BS  # 128-bit loads, 256 threads
+    _k_main = k_val // _KPI  # main loop iters
+    _VPT_T = 4
+    _KPT = _VPT_T * _BS  # 64-bit tail loads
     _k_tail = (k_val - _k_main * _KPI) // _KPT
     _k_done = _k_main * _KPI + _k_tail * _KPT
     _scalar_rem = k_val - _k_done
@@ -20,10 +23,14 @@ def make_host_bf16(k_val: int):
 
     @cute.kernel
     def dotprod_bf16_lf(
-        gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor,
-        M: cutlass.Constexpr, K_dim: cutlass.Constexpr, N_dim: cutlass.Int32,
+        gA: cute.Tensor,
+        gB: cute.Tensor,
+        gC: cute.Tensor,
+        M: cutlass.Constexpr,
+        K_dim: cutlass.Constexpr,
+        N_dim: cutlass.Int32,
     ):
-        cute.arch.setmaxregister_increase(128) #TODO(roberto): limit to 64?
+        cute.arch.setmaxregister_increase(128)  # TODO(roberto): limit to 64?
         tidx = cute.arch.thread_idx()[0]
         n_idx = cute.arch.block_idx()[0]  # one CTA per expert
         VPT: cutlass.Constexpr = _VPT
@@ -60,7 +67,9 @@ def make_host_bf16(k_val: int):
             # Compute (all data in registers)
             for m in cutlass.range_constexpr(M):
                 for v in cutlass.range_constexpr(VPT):
-                    acc[m] = acc[m] + ar_all[m, v].to(cutlass.Float32) * br[v].to(cutlass.Float32)
+                    acc[m] = acc[m] + ar_all[m, v].to(cutlass.Float32) * br[v].to(
+                        cutlass.Float32
+                    )
 
         VPT_T: cutlass.Constexpr = _VPT_T
         KPT: cutlass.Constexpr = _KPT
@@ -79,7 +88,9 @@ def make_host_bf16(k_val: int):
                 ar = cute.make_rmem_tensor((VPT_T,), elem)
                 cute.autovec_copy(at, ar)
                 for v in cutlass.range_constexpr(VPT_T):
-                    acc[m] = acc[m] + ar[v].to(cutlass.Float32) * br[v].to(cutlass.Float32)
+                    acc[m] = acc[m] + ar[v].to(cutlass.Float32) * br[v].to(
+                        cutlass.Float32
+                    )
 
         # Scalar tail (one element per thread for non-aligned K)
         K_DONE_ALL: cutlass.Constexpr = _k_done
@@ -136,13 +147,19 @@ def make_host_bf16(k_val: int):
 
     @cute.jit
     def host_bf16_lf(
-        gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor,
-        M: cutlass.Constexpr, K_dim: cutlass.Constexpr,
-        N_dim: cutlass.Int32, stream: CUstream,
+        gA: cute.Tensor,
+        gB: cute.Tensor,
+        gC: cute.Tensor,
+        M: cutlass.Constexpr,
+        K_dim: cutlass.Constexpr,
+        N_dim: cutlass.Int32,
+        stream: CUstream,
     ):
         dotprod_bf16_lf(gA, gB, gC, M, K_dim, N_dim).launch(
-            grid=[N_dim, 1, 1], block=[256, 1, 1],
-            smem=M * 4 * 8, stream=stream, 
+            grid=[N_dim, 1, 1],
+            block=[256, 1, 1],
+            smem=M * 4 * 8,
+            stream=stream,
             use_pdl=True,
         )
 
