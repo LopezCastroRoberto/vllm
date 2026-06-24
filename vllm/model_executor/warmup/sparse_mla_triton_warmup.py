@@ -7,9 +7,6 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.logger import init_logger
-from vllm.model_executor.warmup.v1_slot_mapping_warmup import (
-    warm_v1_slot_mapping_kernel as _warm_v1_slot_mapping_kernel,
-)
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -153,6 +150,8 @@ def _warm_prefill_chunk_metadata_kernel(
     query_slices = (
         slice(0, num_reqs * query_len),
         slice(0, num_reqs * query_len - 1),
+        slice(1, num_reqs * query_len),
+        slice(1, num_reqs * query_len - 1),
     )
     for warmup_uncompressed_seq_lens in (
         uncompressed_seq_lens,
@@ -262,12 +261,10 @@ def sparse_mla_triton_warmup(
     combine_topk_swa_cases: tuple[tuple[int, int, int, int], ...] = (),
 ) -> None:
     device = getattr(runner, "device", torch.device("cuda"))
-    max_tokens = runner.scheduler_config.max_num_batched_tokens
     window_size = _hf_config_int(
         runner, "sliding_window", _SPARSE_METADATA_WARMUP_WINDOW_SIZE
     )
 
-    _warm_v1_slot_mapping_kernel(device, max_tokens)
     _warm_sparse_swa_prefill_metadata_kernel(device, window_size)
     for compress_ratio in compress_ratios:
         _warm_prefill_chunk_metadata_kernel(device, compress_ratio)
