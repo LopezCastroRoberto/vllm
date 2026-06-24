@@ -25,6 +25,12 @@ from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     deepseek_v4_sparse_mla_attention_warmup,
     flashinfer_sparse_mla_decode_autotune_warmup,
 )
+from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
+    sparse_mla_triton_warmup_if_needed,
+)
+from vllm.model_executor.warmup.v1_slot_mapping_warmup import (
+    warm_v1_slot_mapping_kernel,
+)
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.flashinfer import has_flashinfer
@@ -41,6 +47,15 @@ def kernel_warmup(worker: "Worker"):
         minimax_m3_msa_warmup,
     )
 
+    if not worker.model_runner.is_pooling_model:
+        try:
+            warm_v1_slot_mapping_kernel(
+                getattr(worker.model_runner, "device", torch.device("cuda")),
+                worker.scheduler_config.max_num_batched_tokens,
+            )
+        except Exception:
+            logger.warning("Skipping v1 slot mapping Triton warmup.", exc_info=True)
+
     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
     # layer per token; warm them across token sizes first so the first real
     # request doesn't pay JIT cost. No-op for non-DSv4 models (gated inside).
@@ -53,6 +68,7 @@ def kernel_warmup(worker: "Worker"):
     )
 
     # Run next so input-prep kernels JIT against pristine runner state.
+    sparse_mla_triton_warmup_if_needed(worker)
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
     deepseek_v4_sparse_mla_attention_warmup(worker)
 
