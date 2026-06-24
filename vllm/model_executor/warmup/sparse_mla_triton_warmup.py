@@ -32,6 +32,21 @@ _GENERIC_SPARSE_MLA_BACKENDS = frozenset(
 
 _SPARSE_METADATA_WARMUP_PREFILL_TOKENS = 8
 _SPARSE_METADATA_WARMUP_WINDOW_SIZE = 128
+_SPARSE_PREFILL_METADATA_NUM_PREFILLS = (1, 2, 4, 8)
+_SPARSE_PREFILL_METADATA_NUM_DECODES = (0, 1, 2)
+_PREFILL_CHUNK_METADATA_QUERY_SLICE_OFFSETS = (
+    # query_slice_start offset, query_slice_stop offset
+    (0, 0),
+    (0, -1),
+    (1, 0),
+    (1, -1),
+)
+_COMBINE_TOPK_SWA_INPUT_VARIANTS = (
+    # offset_topk, offset_query_and_seq, offset_gather
+    (False, False, False),
+    (False, True, False),
+    (True, True, True),
+)
 _DSV4_COMBINE_TOPK_SWA_WARMUP_CASES = (
     # compress_ratio, topk, topk_width, N
     (1, 0, 512, 512),
@@ -86,8 +101,8 @@ def _warm_sparse_swa_prefill_metadata_kernel(
         _compute_prefill_metadata_kernel,
     )
 
-    for num_prefills in (1, 2, 4, 8):
-        for num_decodes in (0, 1, 2):
+    for num_prefills in _SPARSE_PREFILL_METADATA_NUM_PREFILLS:
+        for num_decodes in _SPARSE_PREFILL_METADATA_NUM_DECODES:
             query_lens = [1] * num_decodes
             query_lens += [_SPARSE_METADATA_WARMUP_PREFILL_TOKENS] * num_prefills
             query_start_locs = [0]
@@ -131,7 +146,10 @@ def _warm_prefill_chunk_metadata_kernel(
     query_start_loc = query_start_loc_cpu.to(device=device)
 
     uncompressed_seq_lens_cpu = torch.tensor(
-        [compress_ratio * 2 + query_len, compress_ratio * 3 + query_len],
+        [
+            compress_ratio * multiplier + query_len
+            for multiplier in (2, 3)
+        ],
         dtype=torch.int32,
     )
     compressed_seq_lens_cpu = uncompressed_seq_lens_cpu // compress_ratio
@@ -147,11 +165,9 @@ def _warm_prefill_chunk_metadata_kernel(
         num_reqs + 1, dtype=torch.int32, device=device
     )[1:]
     offset_uncompressed_seq_lens.copy_(uncompressed_seq_lens)
-    query_slices = (
-        slice(0, num_reqs * query_len),
-        slice(0, num_reqs * query_len - 1),
-        slice(1, num_reqs * query_len),
-        slice(1, num_reqs * query_len - 1),
+    query_slices = tuple(
+        slice(start, num_reqs * query_len + stop)
+        for start, stop in _PREFILL_CHUNK_METADATA_QUERY_SLICE_OFFSETS
     )
     for warmup_uncompressed_seq_lens in (
         uncompressed_seq_lens,
@@ -224,12 +240,11 @@ def _warm_combine_topk_swa_indices_kernel(
     offset_gather_lens = torch.empty(2, dtype=torch.int32, device=device)[1:]
     offset_gather_lens.copy_(gather_lens)
 
-    input_variants = (
-        (False, False, False),
-        (False, True, False),
-        (True, True, True),
-    )
-    for offset_topk, offset_query_and_seq, offset_gather in input_variants:
+    for (
+        offset_topk,
+        offset_query_and_seq,
+        offset_gather,
+    ) in _COMBINE_TOPK_SWA_INPUT_VARIANTS:
         warmup_topk_indices = _make_topk_indices(offset=offset_topk)
         warmup_query_start_loc = (
             offset_query_start_loc if offset_query_and_seq else query_start_loc

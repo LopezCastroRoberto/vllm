@@ -28,8 +28,8 @@ from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
     sparse_mla_triton_warmup_if_needed,
 )
-from vllm.model_executor.warmup.v1_slot_mapping_warmup import (
-    warm_v1_slot_mapping_kernel,
+from vllm.model_executor.warmup.v1_block_table_warmup import (
+    warm_v1_block_table_kernels,
 )
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import is_deep_gemm_supported
@@ -47,14 +47,15 @@ def kernel_warmup(worker: "Worker"):
         minimax_m3_msa_warmup,
     )
 
+    # Pooling models do not use the generation slot-mapping path.
     if not worker.model_runner.is_pooling_model:
         try:
-            warm_v1_slot_mapping_kernel(
+            warm_v1_block_table_kernels(
                 getattr(worker.model_runner, "device", torch.device("cuda")),
                 worker.scheduler_config.max_num_batched_tokens,
             )
         except Exception:
-            logger.warning("Skipping v1 slot mapping Triton warmup.", exc_info=True)
+            logger.warning("Skipping v1 block-table Triton warmup.", exc_info=True)
 
     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
     # layer per token; warm them across token sizes first so the first real
