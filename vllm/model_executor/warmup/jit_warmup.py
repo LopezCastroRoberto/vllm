@@ -9,7 +9,6 @@ import inspect
 import itertools
 import operator
 import textwrap
-from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
@@ -120,9 +119,11 @@ def _eval_dispatch_expr(
         return node.value
 
     if isinstance(node, ast.IfExp):
-        branch = node.body if _eval_dispatch_expr(
-            node.test, kwargs, globals_
-        ) else node.orelse
+        branch = (
+            node.body
+            if _eval_dispatch_expr(node.test, kwargs, globals_)
+            else node.orelse
+        )
         return _eval_dispatch_expr(branch, kwargs, globals_)
 
     if isinstance(node, ast.Tuple):
@@ -132,9 +133,7 @@ def _eval_dispatch_expr(
         return [_eval_dispatch_expr(elt, kwargs, globals_) for elt in node.elts]
 
     if isinstance(node, ast.BoolOp):
-        values = (
-            _eval_dispatch_expr(value, kwargs, globals_) for value in node.values
-        )
+        values = (_eval_dispatch_expr(value, kwargs, globals_) for value in node.values)
         if isinstance(node.op, ast.And):
             return all(values)
         if isinstance(node.op, ast.Or):
@@ -198,7 +197,9 @@ def _collect_input_names(
     }
 
 
-def _trace_compile_key_dispatch(fn: CompileKeyDispatchFn[Any]) -> _CompileKeyDispatchTrace:
+def _trace_compile_key_dispatch(
+    fn: CompileKeyDispatchFn[Any],
+) -> _CompileKeyDispatchTrace:
     source_fn = getattr(fn, "__func__", fn)
     globals_ = source_fn.__globals__
     function_def = get_function_source_node(fn)
@@ -215,12 +216,17 @@ def _trace_compile_key_dispatch(fn: CompileKeyDispatchFn[Any]) -> _CompileKeyDis
 
     field_exprs: list[tuple[str, ast.AST]] = []
     signature = inspect.signature(fn)
+    source_signature = inspect.signature(source_fn)
     defaults = {
         name: parameter.default
         for name, parameter in signature.parameters.items()
         if parameter.default is not inspect.Parameter.empty
     }
-    candidate_names = set(signature.parameters)
+    bound_receiver = getattr(fn, "__self__", None)
+    first_source_parameter = next(iter(source_signature.parameters), None)
+    if bound_receiver is not None and first_source_parameter in ("self", "cls"):
+        defaults[first_source_parameter] = bound_receiver
+    candidate_names = set(signature.parameters) | set(defaults)
     input_names: set[str] = set()
     for keyword in returns[0].keywords:
         if keyword.arg is None:
@@ -233,16 +239,34 @@ def _trace_compile_key_dispatch(fn: CompileKeyDispatchFn[Any]) -> _CompileKeyDis
     )
 
 
-class VllmJitKernel(Generic[CompileKeyT], ABC):
-    """Kernel wrapper that owns dispatch, warmup keys, and compilation."""
+class VllmJitKernel(Generic[CompileKeyT]):
+    """Callable kernel handle that owns dispatch, warmup keys, and compilation."""
 
     CompileKey: type[CompileKeyT]
 
-    def __init__(self) -> None:
-        self.compile_key_dispatch_trace = _trace_compile_key_dispatch(self.dispatch)
+    def __init__(self, spec: type[Any] | None = None) -> None:
+        if spec is None:
+            spec = type(self)
+        self.spec: Any = spec
+        self.CompileKey = spec.CompileKey
+        self._dispatch = self._bind("dispatch")
+        self._compile_key_dispatch_trace = _trace_compile_key_dispatch(self._dispatch)
+
+    def _bind(self, name: str) -> Any:
+        attr = getattr(self.spec, name)
+        get = getattr(attr, "__get__", None)
+        if get is None:
+            return attr
+        return get(self, type(self))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.spec, name)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._bind("launch")(*args, **kwargs)
 
     def compile_key(self, kwargs: Mapping[str, Any]) -> CompileKeyT:
-        return self.compile_key_dispatch_trace.compile_key(self.CompileKey, kwargs)
+        return self._compile_key_dispatch_trace.compile_key(self.CompileKey, kwargs)
 
     def _trace_dispatch(
         self, dispatch: CompileKeyDispatchFn[CompileKeyT]
@@ -269,17 +293,19 @@ class VllmJitKernel(Generic[CompileKeyT], ABC):
 
         return traced
 
-    @abstractmethod
     def dispatch(self, **kwargs: Any) -> CompileKeyT:
         """Build one compile key from one concrete dispatch point."""
-        raise NotImplementedError
+        return self._dispatch(**kwargs)
 
-    @abstractmethod
     def get_warmup_keys(self, *args: Any, **kwargs: Any) -> list[CompileKeyT]:
         """Return compile keys that should be warmed for this kernel."""
-        raise NotImplementedError
+        return self._bind("get_warmup_keys")(*args, **kwargs)
 
-    @abstractmethod
     def compile(self, compile_key: CompileKeyT) -> None:
         """Compile one warmup key."""
-        raise NotImplementedError
+        return self._bind("compile")(compile_key)
+
+    def warmup(self, *args: Any, **kwargs: Any) -> None:
+        """Compile all warmup keys for this kernel."""
+        for compile_key in self.get_warmup_keys(*args, **kwargs):
+            self.compile(compile_key)
