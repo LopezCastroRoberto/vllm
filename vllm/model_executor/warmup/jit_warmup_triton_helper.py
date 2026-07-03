@@ -3,13 +3,58 @@
 import ast
 import inspect
 from collections.abc import Callable
-from dataclasses import dataclass, fields, is_dataclass
-from typing import Any
+from dataclasses import asdict, dataclass, fields, is_dataclass
+from typing import Any, Generic, Protocol, TypeVar, cast
 
 from vllm.model_executor.warmup.jit_warmup import (
+    VllmJitKernel,
     get_ast_full_name,
     get_function_source_node,
 )
+
+CompileKeyT = TypeVar("CompileKeyT")
+
+
+class _TritonKernel(Protocol):
+    def __getitem__(self, grid: tuple[int, ...]) -> Callable[..., Any]: ...
+
+
+class VllmTritonKernel(
+    VllmJitKernel[CompileKeyT],
+    Generic[CompileKeyT],
+):
+    """Triton kernel wrapper with automatic compile-key validation."""
+
+    def __init__(self, spec: type[Any]) -> None:
+        extra_compile_key_fields = getattr(spec, "extra_compile_key_fields", ())
+        assert_compile_key_matches_triton(
+            spec,
+            spec.triton_kernel,
+            extra_compile_key_fields=extra_compile_key_fields,
+        )
+        super().__init__(spec)
+
+    @property
+    def triton_kernel(self) -> _TritonKernel:
+        return self.spec.triton_kernel
+
+    def triton_call(
+        self,
+        grid: tuple[int, ...],
+        compile_key: CompileKeyT,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Launch the Triton kernel with compile-key fields as constexprs."""
+        return self.triton_kernel[grid](
+            *args,
+            **kwargs,
+            **asdict(cast(Any, compile_key)),
+        )
+
+
+def vllm_triton_kernel(spec: type[Any]) -> VllmTritonKernel[Any]:
+    return VllmTritonKernel(spec)
 
 
 @dataclass(frozen=True)
@@ -191,16 +236,19 @@ def assert_compile_key_matches_triton(
 ) -> None:
     """Check that a wrapper CompileKey matches Triton specialization fields."""
     compile_key_type = jit_kernel.CompileKey
+    jit_kernel_name = (
+        jit_kernel.__name__
+        if isinstance(jit_kernel, type)
+        else type(jit_kernel).__name__
+    )
     if not is_dataclass(compile_key_type):
-        raise TypeError(
-            f"{type(jit_kernel).__name__}.CompileKey must be a dataclass"
-        )
+        raise TypeError(f"{jit_kernel_name}.CompileKey must be a dataclass")
 
     compile_key_args = tuple(field.name for field in fields(compile_key_type))
     triton_args = trace_triton_kernel_specialization_args(triton_kernel)
     expected_args = triton_args + extra_compile_key_fields
     if compile_key_args != expected_args:
         raise ValueError(
-            f"{type(jit_kernel).__name__}.CompileKey fields {compile_key_args} "
+            f"{jit_kernel_name}.CompileKey fields {compile_key_args} "
             f"do not match Triton specialization fields {expected_args}"
         )
