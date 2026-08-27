@@ -427,20 +427,28 @@ def sparse_attn_indexer(
     # The indexer and main MLA may classify the same short extend differently
     # because they use independent decode thresholds. Only the main MLA route
     # can determine whether the top-k indices will be consumed.
+    dense_prefill = False
     if forward_context.cudagraph_runtime_mode != CUDAGraphMode.FULL:
         dense_mha_layer = _resolve_layer_name(dense_mha_metadata_layer_name)
         if dense_mha_layer:
             mla_metadata = attn_metadata.get(dense_mha_layer)
             prefill_metadata = getattr(mla_metadata, "prefill", None)
-            if (
+            dense_mha_selected = bool(
                 getattr(prefill_metadata, "use_dense_mha", False)
-                and getattr(mla_metadata, "num_decode_tokens", -1) == 0
                 and not torch.cuda.is_current_stream_capturing()
-            ):
+            )
+            mla_num_decode_tokens = getattr(mla_metadata, "num_decode_tokens", -1)
+            if dense_mha_selected and mla_num_decode_tokens == 0:
                 # Deliberately leave the buffer untouched. Dense MHA does not
                 # consume top-k indices for this batch; clearing it would be
                 # unnecessary work.
                 return topk_indices_buffer
+            # Independent decode thresholds can classify the same short
+            # extension differently. Only skip the indexer's prefill rows when
+            # both metadata builders agree on the decode/prefill boundary.
+            dense_prefill = bool(
+                dense_mha_selected and mla_num_decode_tokens == num_decode_tokens
+            )
 
     # The buffer must be pre-filled with -1 (the "no token" sentinel) before the
     # top-k kernels scatter valid indices into it. On the fused deepseek_v32
@@ -449,7 +457,7 @@ def sparse_attn_indexer(
     # fill.
     if not skip_topk_buffer_clear:
         topk_indices_buffer[: hidden_states.shape[0]] = -1
-    if has_prefill:
+    if has_prefill and not dense_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
 

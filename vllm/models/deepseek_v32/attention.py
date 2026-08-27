@@ -328,7 +328,6 @@ class DeepseekV32Attention(MLAAttention):
         prefill_metadata = getattr(attn_metadata, "prefill", None)
         use_dense_prefill = (
             attn_metadata is not None
-            and attn_metadata.num_decode_tokens == 0
             and bool(getattr(prefill_metadata, "use_dense_mha", False))
             and self.pcp_spans_dcp
         )
@@ -436,8 +435,64 @@ class DeepseekV32Attention(MLAAttention):
             indexer_n_head_scale,
             has_indexer=has_indexer,
             index_rope_interleave=self._index_rope_interleave,
-            quantize_mqa=self._fp8_query,
+            # Dense MHA needs the RoPE'd q_pe tensor so it can reconstruct
+            # the unabsorbed query below. The packed FP8 MQA query contains
+            # absorbed ql_nope and cannot be passed to the dense backend.
+            quantize_mqa=self._fp8_query and not use_dense_prefill,
         )
+
+        if use_dense_prefill:
+            # The sparse MQA DCP top-k merge assumes matching query rows on all
+            # ranks, but PCP partitions those rows. PCP+DCP prefills use
+            # the generic MLA FlashAttention path, whose chunked-context code
+            # gathers DCP KV shards instead. In mixed batches, the indexer
+            # still scores the replicated decode rows but skips the partitioned
+            # prefill rows that dense MHA does not consume.
+            if self.indexer is not None and not self.skip_topk:
+                assert index_q_fp8 is not None
+                assert index_weights_out is not None
+                if collect_pcp:
+                    assert index_k_out is not None
+                sparse_attn_indexer(
+                    q_c,
+                    self.indexer.k_cache.prefix,
+                    self.indexer.k_cache.kv_cache,
+                    index_q_fp8,
+                    None,
+                    index_k_out,
+                    index_weights_out,
+                    self.indexer.quant_block_size,
+                    self.indexer.scale_fmt,
+                    self.indexer.topk_tokens,
+                    self.indexer.head_dim,
+                    self.indexer.max_model_len,
+                    self.indexer.max_total_seq_len,
+                    self.topk_indices_buffer,
+                    skip_k_cache_insert=not collect_pcp,
+                    use_pcp=collect_pcp,
+                    dense_mha_metadata_layer_name=(self._dense_mha_metadata_layer_name),
+                    dcp_rank=(
+                        self.dcp_manager.group.rank_in_group
+                        if self.dcp_manager is not None
+                        else 0
+                    ),
+                    dcp_world_size=(
+                        self._vllm_config.parallel_config.decode_context_parallel_size
+                    ),
+                    cp_kv_cache_interleave_size=(
+                        self._vllm_config.parallel_config.cp_kv_cache_interleave_size
+                    ),
+                    skip_topk_buffer_clear=True,
+                )
+            assert kv_c_out is not None and k_pe_out is not None
+            dense_q = torch.cat((q_nope, mqa_q), dim=-1)
+            dense_output = super().forward(
+                dense_q,
+                kv_c_out,
+                k_pe_out.unsqueeze(1),
+                output_shape=output.shape,
+            )
+            return self.o_proj(dense_output)[0]
 
         self._sparse_indexer_and_attn(
             q_c,
@@ -556,8 +611,33 @@ class DeepseekV32Attention(MLAAttention):
 
         if self.use_pcp and self.impl.dcp_world_size > 1:
             assert lse is not None and self.dcp_manager is not None
-            seq_lens = cast(torch.Tensor, attn_metadata.seq_lens)  # type: ignore[attr-defined]
-            query_start_loc = attn_metadata.query_start_loc
+            if getattr(attn_metadata, "fp8_use_mixed_batch", False):
+                # Sparse FlashMLA's mixed FP8 path already turns rows with no
+                # locally selected KV tokens into the (0, -inf) merge
+                # identity. It also represents all query tokens as one kernel
+                # batch, so request-level sequence boundaries must not be used
+                # for an additional empty-shard mask.
+                seq_lens = None
+                query_start_loc = None
+            else:
+                # Dense MLA metadata exposes per-decode sequence lengths
+                # through a nested ``decode`` object. Sparse FlashMLA uses a
+                # nested FP8 decode object for separate prefill/decode batches.
+                decode_metadata = getattr(attn_metadata, "decode", None)
+                if decode_metadata is None:
+                    decode_metadata = getattr(
+                        getattr(attn_metadata, "fp8_extra_metadata", None),
+                        "decode",
+                        None,
+                    )
+                seq_lens = (
+                    decode_metadata.seq_lens
+                    if decode_metadata is not None
+                    else cast(torch.Tensor, attn_metadata.seq_lens)[  # type: ignore[attr-defined]
+                        : attn_metadata.num_decodes
+                    ]
+                )
+                query_start_loc = attn_metadata.query_start_loc[: seq_lens.shape[0] + 1]
             attn_out = self.dcp_manager.combine(
                 attn_out,
                 lse,

@@ -302,10 +302,7 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
                 output_dtype=self.model_config.dtype,
                 prefill_backend=self._prefill_backend,
                 use_dense_mha=(
-                    (
-                        prefill_max_seq_len <= self.topk_tokens
-                        or (self.pcp_spans_dcp and num_decode_tokens == 0)
-                    )
+                    (prefill_max_seq_len <= self.topk_tokens or self.pcp_spans_dcp)
                     and not self.vllm_config.attention_config.sparse_mla_force_mqa
                 ),
                 topk_mask_workspace=self.topk_mask_workspace,
@@ -821,9 +818,15 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
     ) -> None:
         prefill_max_seq_len = attn_metadata.prefill_max_seq_len  # type: ignore[attr-defined]
         topk_tokens = attn_metadata.topk_tokens  # type: ignore[attr-defined]
+        prefill_metadata = attn_metadata.prefill  # type: ignore[attr-defined]
+        use_dense_mha = bool(getattr(prefill_metadata, "use_dense_mha", False))
         force_dense = getattr(self, "_sparse_mla_force_dense_mha", False)
         force_masked = getattr(self, "_sparse_mla_force_masked_mha", False)
-        if force_dense or (prefill_max_seq_len <= topk_tokens and not force_masked):
+        if (
+            force_dense
+            or use_dense_mha
+            or (prefill_max_seq_len <= topk_tokens and not force_masked)
+        ):
             return super().forward_mha(
                 q,
                 kv_c_normed,
@@ -837,7 +840,6 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
 
         assert output_scale is None
         assert self.masked_mha_available
-        prefill_metadata = attn_metadata.prefill  # type: ignore[attr-defined]
         assert prefill_metadata is not None
         assert prefill_metadata.query_lens_cpu is not None
         assert self.topk_indices_buffer is not None
