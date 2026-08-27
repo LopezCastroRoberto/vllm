@@ -1296,11 +1296,14 @@ def unified_mla_kv_cache_update(
             kv_cache_dtype,
             k_scale,
         )
-        from vllm.model_executor.layers.attention.pcp_direct_kv import (
-            publish_pcp_sharded_peer_kv,
-        )
+    # The peer-cache fence is group-wide even when this rank has no local rows.
+    # PCP can assign zero tokens to a rank, so placing this inside the
+    # layer_slot_mapping branch gives different fence epochs across peers.
+    from vllm.model_executor.layers.attention.pcp_direct_kv import (
+        publish_pcp_sharded_peer_kv,
+    )
 
-        publish_pcp_sharded_peer_kv()
+    publish_pcp_sharded_peer_kv()
 
     return torch.empty(0, device=kv_c_normed.device, dtype=kv_c_normed.dtype)
 
