@@ -45,7 +45,9 @@ def test_flashinfer_mla_forward_uses_gathered_head_count(monkeypatch):
     impl.bmm1_scale = 1.0
     impl.bmm2_scale = 1.0
     impl.need_to_return_lse_for_decode = True
-    impl.dcp_world_size = 2
+    impl.dcp_world_size = 1
+    impl.dcp_rank = 0
+    impl.cp_kv_cache_interleave_size = 1
     impl.num_heads = 6
     impl.qk_nope_head_dim = 128
     impl.kv_lora_rank = 512
