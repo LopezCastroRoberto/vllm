@@ -236,6 +236,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         input_batch: InputBatch,
         aux_hidden_states: list[torch.Tensor],
         slot_mappings: dict[str, torch.Tensor],
+        retain_for_proposal: bool = True,
     ) -> None:
         """Build rank-local context KV and publish it in the active PCP layout."""
         if self._pcp_context_kv_precomputed:
@@ -264,7 +265,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             context_slot_mappings,
             publish_to_pcp=True,
         )
-        self._pcp_context_kv_precomputed = True
+        self._pcp_context_kv_precomputed = retain_for_proposal
 
     @torch.inference_mode()
     def _run_model(

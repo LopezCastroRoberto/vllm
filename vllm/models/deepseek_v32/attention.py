@@ -136,6 +136,11 @@ class DeepseekV32Attention(MLAAttention):
     ) -> None:
         quant_config = vllm_config.quant_config
         cache_config = vllm_config.cache_config
+        parallel_config = vllm_config.parallel_config
+        self.supports_dense_mha_prefill = (
+            parallel_config.prefill_context_parallel_size > 1
+            and parallel_config.decode_context_parallel_size > 1
+        )
 
         hidden_size = config.hidden_size
         qk_nope_head_dim = config.qk_nope_head_dim
@@ -225,10 +230,14 @@ class DeepseekV32Attention(MLAAttention):
         self.topk_indices_buffer = topk_indices_buffer
 
         self.skip_topk = False
+        self.pcp_spans_dcp = (
+            self.use_pcp
+            and vllm_config.parallel_config.decode_context_parallel_size > 1
+        )
         enable_short_prefill_scoring_skip = (
             not is_mtp_layer
             and not skip_topk
-            and not self.use_pcp
+            and (not self.use_pcp or self.pcp_spans_dcp)
             and current_platform.is_cuda()
             and self.supports_dense_mha_prefill
         )
@@ -316,6 +325,13 @@ class DeepseekV32Attention(MLAAttention):
         else:
             attn_metadata = attn_metadata_raw
         attn_metadata = cast("MLACommonMetadata | None", attn_metadata)
+        prefill_metadata = getattr(attn_metadata, "prefill", None)
+        use_dense_prefill = (
+            attn_metadata is not None
+            and attn_metadata.num_decode_tokens == 0
+            and bool(getattr(prefill_metadata, "use_dense_mha", False))
+            and self.pcp_spans_dcp
+        )
 
         slot_mapping = forward_context.slot_mapping
         assert isinstance(slot_mapping, dict)
