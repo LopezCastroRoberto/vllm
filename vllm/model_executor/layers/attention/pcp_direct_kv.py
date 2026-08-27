@@ -69,7 +69,6 @@ def _peer_cache_fence_kernel(
             sem="release",
             scope="sys",
         )
-
     # System-scope acquire waits until every peer has published the same epoch.
     peer_rank = tl.arange(0, BLOCK_SIZE)
     mask = peer_rank < world_size
@@ -88,23 +87,39 @@ def _peer_cache_fence_kernel(
 def _copy_cache_rows_to_peers_kernel(
     peer_ptrs,
     slot_mapping,
-    row_nbytes,
     source_rank: tl.constexpr,
     world_size: tl.constexpr,
+    num_physical_rows: tl.constexpr,
+    cache_block_size: tl.constexpr,
+    cache_block_stride_bytes: tl.constexpr,
+    cache_token_stride_bytes: tl.constexpr,
+    segment_stride_bytes: tl.constexpr,
+    segment_nbytes: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
-    byte_offset = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    segment_idx = tl.program_id(1)
+    byte_offset = tl.program_id(2) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     slot = tl.load(slot_mapping + token_idx)
-    mask = (slot >= 0) & (byte_offset < row_nbytes)
+    valid_slot = (slot >= 0) & (slot < num_physical_rows)
+    block_idx = slot // cache_block_size
+    block_offset = slot % cache_block_size
+    row_offset = (
+        block_idx * cache_block_stride_bytes
+        + block_offset * cache_token_stride_bytes
+        + segment_idx * segment_stride_bytes
+        + byte_offset
+    )
+    mask = valid_slot & (byte_offset < segment_nbytes)
+
     source_base = tl.load(peer_ptrs + source_rank).to(tl.pointer_type(tl.uint8))
-    source = source_base + slot * row_nbytes + byte_offset
-    value = tl.load(source, mask=mask, other=0)
-    for peer in tl.static_range(0, world_size):
-        if peer != source_rank:
-            destination_base = tl.load(peer_ptrs + peer).to(tl.pointer_type(tl.uint8))
-            destination = destination_base + slot * row_nbytes + byte_offset
-            tl.store(destination, value, mask=mask)
+    value = tl.load(source_base + row_offset, mask=mask, other=0)
+    for peer_rank in tl.static_range(0, world_size):
+        if peer_rank != source_rank:
+            destination_base = tl.load(peer_ptrs + peer_rank).to(
+                tl.pointer_type(tl.uint8)
+            )
+            tl.store(destination_base + row_offset, value, mask=mask)
 
 
 class PCPPeerCacheFence:
@@ -190,25 +205,47 @@ def copy_pcp_cache_rows_to_peers(
     slot_mapping: torch.Tensor,
     peer_ptrs: torch.Tensor,
     source_rank: int,
-    block_size: int,
+    token_dim: int,
+    segment_dim: int | None = None,
 ) -> None:
-    """Copy locally produced physical cache rows to every PCP peer.
-
-    The cache must be a contiguous paged tensor whose first two logical
-    dimensions are ``[num_blocks, block_size]``. The copy is byte-oriented,
-    so it preserves BF16, FP8 and packed cache row layouts unchanged.
-    """
+    """Copy locally produced physical cache rows to every PCP replica."""
     if not cache.is_cuda or not slot_mapping.is_cuda or not peer_ptrs.is_cuda:
         raise ValueError("PCP cache-row publication requires CUDA tensors")
-    if not cache.is_contiguous():
-        raise ValueError("PCP cache-row publication requires a contiguous cache")
-    if cache.ndim < 2 or cache.shape[1] != block_size:
+    if not 0 < token_dim < cache.ndim:
         raise ValueError(
-            "Expected paged cache shape [num_blocks, block_size, ...], got "
-            f"{tuple(cache.shape)} with block_size={block_size}"
+            f"Invalid token dimension {token_dim} for {tuple(cache.shape)}"
+        )
+    if segment_dim is not None and (
+        not 0 < segment_dim < cache.ndim or segment_dim == token_dim
+    ):
+        raise ValueError(
+            f"Invalid segment dimension {segment_dim} for {tuple(cache.shape)}"
         )
     if slot_mapping.ndim != 1:
         raise ValueError("PCP cache-row slot mapping must be one-dimensional")
+
+    # Packed caches use one contiguous segment per token. Head-major attention
+    # caches use one contiguous content segment per head and token.
+    payload_dims = [
+        dim for dim in range(1, cache.ndim) if dim != token_dim and dim != segment_dim
+    ]
+    segment_elements = 1
+    for dim in sorted(payload_dims, key=cache.stride):
+        size = cache.shape[dim]
+        if size != 1 and cache.stride(dim) != segment_elements:
+            raise ValueError("PCP cache-row segments must be contiguous")
+        segment_elements *= size
+    if cache.stride(token_dim) < segment_elements:
+        raise ValueError("PCP cache token segments overlap")
+    if segment_dim is None:
+        segment_count = 1
+        segment_stride = 0
+    else:
+        segment_count = cache.shape[segment_dim]
+        segment_stride = cache.stride(segment_dim)
+        if segment_stride < segment_elements:
+            raise ValueError("PCP cache row segments overlap")
+
     world_size = peer_ptrs.numel()
     if world_size <= 1 or slot_mapping.numel() == 0:
         return
@@ -216,20 +253,27 @@ def copy_pcp_cache_rows_to_peers(
         raise ValueError(
             f"PCP source rank {source_rank} is outside world size {world_size}"
         )
-    num_physical_rows = cache.shape[0] * block_size
-    cache_nbytes = cache.numel() * cache.element_size()
-    if cache_nbytes % num_physical_rows != 0:
-        raise ValueError("Cache byte size is not divisible by its physical rows")
-    row_nbytes = cache_nbytes // num_physical_rows
+
     block = 256
+    cache_block_size = cache.shape[token_dim]
+    segment_nbytes = segment_elements * cache.element_size()
     _copy_cache_rows_to_peers_kernel[
-        (slot_mapping.numel(), triton.cdiv(row_nbytes, block))
+        (
+            slot_mapping.numel(),
+            segment_count,
+            triton.cdiv(segment_nbytes, block),
+        )
     ](
         peer_ptrs,
         slot_mapping,
-        row_nbytes,
         source_rank=source_rank,
         world_size=world_size,
+        num_physical_rows=cache.shape[0] * cache_block_size,
+        cache_block_size=cache_block_size,
+        cache_block_stride_bytes=cache.stride(0) * cache.element_size(),
+        cache_token_stride_bytes=cache.stride(token_dim) * cache.element_size(),
+        segment_stride_bytes=segment_stride * cache.element_size(),
+        segment_nbytes=segment_nbytes,
         BLOCK_SIZE=block,
     )
 
@@ -238,7 +282,8 @@ def publish_pcp_cache_rows(
     layer_name: str,
     cache: torch.Tensor,
     slot_mapping: torch.Tensor,
-    block_size: int,
+    token_dim: int,
+    segment_dim: int | None = None,
 ) -> None:
     if not _STATE.enabled:
         raise RuntimeError("PCP direct-KV is not active")
@@ -246,7 +291,12 @@ def publish_pcp_cache_rows(
     if peer_ptrs is None:
         raise RuntimeError(f"No PCP peer cache pointers registered for {layer_name}")
     copy_pcp_cache_rows_to_peers(
-        cache, slot_mapping, peer_ptrs, _STATE.rank, block_size
+        cache,
+        slot_mapping,
+        peer_ptrs,
+        _STATE.rank,
+        token_dim,
+        segment_dim,
     )
 
 
