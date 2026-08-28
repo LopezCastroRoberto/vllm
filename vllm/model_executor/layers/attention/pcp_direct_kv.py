@@ -122,6 +122,69 @@ def _copy_cache_rows_to_peers_kernel(
             tl.store(destination_base + row_offset, value, mask=mask)
 
 
+@triton.jit
+def _store_kv_rows_to_peers_kernel(
+    key_ptr,
+    value_ptr,
+    peer_ptrs,
+    slot_mapping,
+    key_token_stride: tl.int64,
+    key_head_stride: tl.int64,
+    value_token_stride: tl.int64,
+    value_head_stride: tl.int64,
+    cache_block_stride: tl.int64,
+    cache_head_stride: tl.int64,
+    cache_token_stride: tl.int64,
+    cache_dim_stride: tl.int64,
+    world_size: tl.constexpr,
+    num_physical_rows: tl.constexpr,
+    cache_block_size: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    tile_idx = tl.program_id(1)
+    tile_offset = tile_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    head_idx = tile_offset // head_size
+    dim_idx = tile_offset % head_size
+    payload_mask = tile_offset < num_heads * head_size
+
+    slot = tl.load(slot_mapping + token_idx).to(tl.int64)
+    valid_slot = (slot >= 0) & (slot < num_physical_rows)
+    block_idx = slot // cache_block_size
+    block_offset = slot % cache_block_size
+
+    key = tl.load(
+        key_ptr + token_idx * key_token_stride + head_idx * key_head_stride + dim_idx,
+        mask=payload_mask,
+    )
+    value = tl.load(
+        value_ptr
+        + token_idx * value_token_stride
+        + head_idx * value_head_stride
+        + dim_idx,
+        mask=payload_mask,
+    )
+    cache_offset = (
+        block_idx * cache_block_stride
+        + head_idx * cache_head_stride
+        + block_offset * cache_token_stride
+        + dim_idx * cache_dim_stride
+    )
+    store_mask = payload_mask & valid_slot
+    for peer_rank in tl.static_range(0, world_size):
+        peer_base = tl.load(peer_ptrs + peer_rank).to(
+            tl.pointer_type(key_ptr.dtype.element_ty)
+        )
+        tl.store(peer_base + cache_offset, key, mask=store_mask)
+        tl.store(
+            peer_base + cache_offset + head_size * cache_dim_stride,
+            value,
+            mask=store_mask,
+        )
+
+
 class PCPPeerCacheFence:
     """Device-epoch release/acquire publication for one PCP group."""
 
@@ -196,6 +259,98 @@ def get_layer_peer_ptrs(layer_name: str) -> torch.Tensor | None:
     if not _STATE.enabled:
         return None
     return _STATE.layer_peer_ptrs.get(layer_name)
+
+
+def store_pcp_kv_rows_to_peers(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    peer_ptrs: torch.Tensor,
+) -> bool:
+    """Store projected K/V directly into every PCP cache replica."""
+    if (
+        key.ndim != 3
+        or value.shape != key.shape
+        or cache.ndim != 4
+        or cache.shape[1] != key.shape[1]
+        or cache.shape[3] != 2 * key.shape[2]
+        or cache.dtype != key.dtype
+        or value.dtype != key.dtype
+        or key.dtype not in (torch.bfloat16, torch.float16)
+        or key.stride(2) != 1
+        or value.stride(2) != 1
+        or cache.stride(3) != 1
+        or cache.stride(2) < 2 * key.shape[2]
+    ):
+        return False
+    if (
+        not key.is_cuda
+        or not value.is_cuda
+        or not cache.is_cuda
+        or not slot_mapping.is_cuda
+        or not peer_ptrs.is_cuda
+    ):
+        raise ValueError("PCP direct cache stores require CUDA tensors")
+    if not (
+        key.device
+        == value.device
+        == cache.device
+        == slot_mapping.device
+        == peer_ptrs.device
+    ):
+        raise ValueError("PCP direct cache-store tensors must share one device")
+    if slot_mapping.ndim != 1 or slot_mapping.numel() > key.shape[0]:
+        raise ValueError("Invalid PCP direct cache-store slot mapping")
+    if peer_ptrs.numel() <= 1 or slot_mapping.numel() == 0:
+        return False
+
+    block = 256
+    payload_elements = key.shape[1] * key.shape[2]
+    _store_kv_rows_to_peers_kernel[
+        (slot_mapping.numel(), triton.cdiv(payload_elements, block))
+    ](
+        key,
+        value,
+        peer_ptrs,
+        slot_mapping,
+        key_token_stride=key.stride(0),
+        key_head_stride=key.stride(1),
+        value_token_stride=value.stride(0),
+        value_head_stride=value.stride(1),
+        cache_block_stride=cache.stride(0),
+        cache_head_stride=cache.stride(1),
+        cache_token_stride=cache.stride(2),
+        cache_dim_stride=cache.stride(3),
+        world_size=peer_ptrs.numel(),
+        num_physical_rows=cache.shape[0] * cache.shape[2],
+        cache_block_size=cache.shape[2],
+        num_heads=key.shape[1],
+        head_size=key.shape[2],
+        BLOCK_SIZE=block,
+    )
+    return True
+
+
+def try_store_pcp_kv_rows_to_peers(
+    layer_name: str,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> bool:
+    if not _STATE.enabled:
+        raise RuntimeError("PCP direct-KV is not active")
+    peer_ptrs = _STATE.layer_peer_ptrs.get(layer_name)
+    if peer_ptrs is None:
+        raise RuntimeError(f"No PCP peer cache pointers registered for {layer_name}")
+    return store_pcp_kv_rows_to_peers(
+        key,
+        value,
+        cache,
+        slot_mapping,
+        peer_ptrs,
+    )
 
 
 def copy_pcp_cache_rows_to_peers(

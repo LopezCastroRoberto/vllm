@@ -649,6 +649,7 @@ class DFlashQwen3Model(nn.Module):
             from vllm.model_executor.layers.attention.pcp_direct_kv import (
                 publish_pcp_cache_rows,
                 publish_pcp_direct_kv,
+                try_store_pcp_kv_rows_to_peers,
             )
 
         # --- Per-layer cache insert ---
@@ -663,14 +664,22 @@ class DFlashQwen3Model(nn.Module):
                 continue  # dummy run: skip cache ops
             attn = self._attn_layers[i]
             kv_cache = attn.kv_cache
-            attn.impl.do_kv_cache_update(
-                attn,
+            directly_stored = publish_to_pcp and try_store_pcp_kv_rows_to_peers(
+                attn.layer_name,
                 all_k_final[i],
                 all_v[i],
                 kv_cache,
                 slot_mapping,
             )
-            if publish_to_pcp:
+            if not directly_stored:
+                attn.impl.do_kv_cache_update(
+                    attn,
+                    all_k_final[i],
+                    all_v[i],
+                    kv_cache,
+                    slot_mapping,
+                )
+            if publish_to_pcp and not directly_stored:
                 publish_pcp_cache_rows(
                     attn.layer_name,
                     kv_cache,

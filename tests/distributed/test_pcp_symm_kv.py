@@ -375,6 +375,100 @@ def _worker_copy_strided_cache_rows(env: dict[str, str]) -> None:
     dist.destroy_process_group()
 
 
+def _worker_store_kv_rows_directly_to_peers(env: dict[str, str]) -> None:
+    update_environment_variables(env)
+    rank = int(env["RANK"])
+    world_size = int(env["WORLD_SIZE"])
+    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+    from vllm.distributed.device_communicators.symm_mem import allocate_symm_mem_peer
+    from vllm.model_executor.layers.attention.pcp_direct_kv import (
+        PCPPeerCacheFence,
+        store_pcp_kv_rows_to_peers,
+    )
+
+    device = torch.device(f"cuda:{rank}")
+    block_size = 4
+    num_blocks = 4
+    num_heads = 3
+    head_size = 17
+    token_stride = 2 * head_size + 3
+    head_stride = block_size * token_stride + 5
+    block_stride = num_heads * head_stride + 7
+    prefix_elements = 32
+    suffix_elements = 29
+    cache_span = (
+        (num_blocks - 1) * block_stride
+        + (num_heads - 1) * head_stride
+        + (block_size - 1) * token_stride
+        + 2 * head_size
+    )
+
+    def make_kv(source_rank: int, dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
+        token = torch.arange(4, device=device)[:, None, None]
+        head = torch.arange(num_heads, device=device)[None, :, None]
+        dim = torch.arange(head_size, device=device)[None, None, :]
+        key = (source_rank * 10 + token + head / 10 + dim / 100).to(dtype)
+        value = (-source_rank * 10 - token - head / 10 - dim / 100).to(dtype)
+        return key, value
+
+    for dtype in (torch.bfloat16, torch.float16):
+        element_size = torch.empty((), dtype=dtype).element_size()
+        allocation = allocate_symm_mem_peer(
+            ((prefix_elements + cache_span + suffix_elements) * element_size,),
+            torch.uint8,
+            device,
+            dist.group.WORLD,
+        )
+        guard = 0xA5
+        allocation.storage.fill_(guard)
+        typed_storage = allocation.storage.view(dtype)
+        cache = torch.as_strided(
+            typed_storage[prefix_elements:],
+            (num_blocks, num_heads, block_size, 2 * head_size),
+            (block_stride, head_stride, token_stride, 1),
+        )
+        local_slots = torch.tensor(
+            [rank * 2, rank * 2 + 1, -1, num_blocks * block_size],
+            dtype=torch.int64,
+            device=device,
+        )
+        key, value = make_kv(rank, dtype)
+        assert store_pcp_kv_rows_to_peers(
+            key,
+            value,
+            cache,
+            local_slots,
+            allocation.peer_ptrs_for_view(cache),
+        )
+        fence = PCPPeerCacheFence(dist.group.WORLD, device)
+        fence()
+        torch.cuda.synchronize()
+
+        expected = torch.full_like(allocation.storage, guard)
+        expected_cache = torch.as_strided(
+            expected.view(dtype)[prefix_elements:],
+            cache.shape,
+            cache.stride(),
+        )
+        for source_rank in range(world_size):
+            source_key, source_value = make_kv(source_rank, dtype)
+            for token_idx, slot in enumerate((source_rank * 2, source_rank * 2 + 1)):
+                block_idx, block_offset = divmod(slot, block_size)
+                expected_cache[block_idx, :, block_offset, :head_size].copy_(
+                    source_key[token_idx]
+                )
+                expected_cache[block_idx, :, block_offset, head_size:].copy_(
+                    source_value[token_idx]
+                )
+        assert torch.equal(allocation.storage, expected)
+
+        fence.close()
+        allocation.close()
+    dist.destroy_process_group()
+
+
 def _worker_fused_direct_tp2_pcp2(env: dict[str, str]) -> None:
     update_environment_variables(env)
     global_rank = int(env["RANK"])
@@ -427,6 +521,16 @@ def test_pcp_peer_cache_fence_cudagraph_replay():
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2+ GPUs")
 def test_copy_strided_cache_rows_to_pcp_peers():
     _distributed_run(_worker_copy_strided_cache_rows, world_size=2)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2+ GPUs")
+def test_store_bf16_fp16_kv_rows_directly_to_pcp2_peers():
+    _distributed_run(_worker_store_kv_rows_directly_to_peers, world_size=2)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs")
+def test_store_bf16_fp16_kv_rows_directly_to_pcp4_peers():
+    _distributed_run(_worker_store_kv_rows_directly_to_peers, world_size=4)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2+ GPUs")
