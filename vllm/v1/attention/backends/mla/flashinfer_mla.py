@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
@@ -116,6 +116,7 @@ class FlashInferMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
     # Non-causal DSpark blocks are flattened to single-token rows in forward_mqa.
     supports_non_causal_multi_token_decode: ClassVar[bool] = True
+    supports_non_causal_multi_token_dcp: ClassVar[bool] = True
 
 
 class FlashInferMLABackend(MLACommonBackend):
@@ -271,8 +272,8 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
         seq_lens = attn_metadata.decode.seq_lens
 
         if not attn_metadata.causal:
-            # FlashInfer decode has no causal flag. For TP-only DSpark, flatten
-            # each non-causal query block into independent single-token rows.
+            # FlashInfer decode has no causal flag. Flatten each non-causal
+            # query block into independent single-token rows.
             query_len = attn_metadata.num_decode_tokens // attn_metadata.num_decodes
             q = q.unsqueeze(1)
             if query_len > 1:
@@ -303,10 +304,27 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
         workspace_buffer = _get_workspace_buffer(return_lse)
         # Parallel gathers can change the runtime Q heads from TP-local num_heads.
         runtime_num_heads = q.shape[-2]
-        # trtllm-gen rejects MLA head counts it can't tile (e.g. 96);
-        # fall back to cute-dsl for those.
-        decode_backend = _select_mla_decode_backend(runtime_num_heads)
-        extra_kwargs = {}
+        extra_kwargs: dict[str, Any] = {}
+        decode_backend: str | None
+        if self.dcp_world_size > 1:
+            assert self.cp_kv_cache_interleave_size == 1
+            causal_seqlens_kv_global = attn_metadata.decode.dcp_tot_seq_lens
+            assert causal_seqlens_kv_global is not None
+            if not attn_metadata.causal and query_len > 1:
+                causal_seqlens_kv_global = causal_seqlens_kv_global.repeat_interleave(
+                    query_len
+                )
+            extra_kwargs.update(
+                enable_dcp=True,
+                cp_world=self.dcp_world_size,
+                cp_rank=self.dcp_rank,
+                causal_seqlens_kv_global=causal_seqlens_kv_global,
+            )
+            decode_backend = "cute-dsl"
+        else:
+            # trtllm-gen rejects MLA head counts it can't tile (e.g. 96);
+            # fall back to cute-dsl for those.
+            decode_backend = _select_mla_decode_backend(runtime_num_heads)
         if decode_backend:
             extra_kwargs["backend"] = decode_backend
         elif kv_c_and_k_pe_cache.shape[-2] in (32, 64):
