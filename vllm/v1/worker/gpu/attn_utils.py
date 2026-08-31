@@ -215,6 +215,7 @@ def init_kv_cache(
     from vllm.distributed.parallel_state import get_pcp_group
     from vllm.model_executor.layers.attention.pcp_direct_kv import (
         allocate_pcp_direct_backing,
+        close_pcp_direct_kv,
         pcp_direct_kv_requested,
     )
 
@@ -224,6 +225,9 @@ def init_kv_cache(
             raise RuntimeError(
                 "VLLM_USE_PCP_DIRECT_KV=1 requires PCP world size greater than 1"
             )
+        # Memory profiling creates a temporary KV cache before the serving
+        # cache. Release its symmetric-memory state before replacing it.
+        close_pcp_direct_kv()
 
         def buffer_allocator(nbytes: int, device: torch.device) -> torch.Tensor:
             return allocate_pcp_direct_backing(

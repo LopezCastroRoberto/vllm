@@ -7,6 +7,8 @@ while keeping per-block content compact, so padding bytes at the end of each pag
 never addressed by the logical view.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -51,6 +53,72 @@ class _DraftBackend:
     @classmethod
     def supports_device_cpu_query_lens_mismatch(cls) -> bool:
         return False
+
+
+def test_init_kv_cache_releases_previous_pcp_direct_allocation(monkeypatch):
+    from vllm.distributed import parallel_state
+    from vllm.model_executor.layers.attention import pcp_direct_kv
+    from vllm.v1.worker.gpu import attn_utils
+
+    events: list[str] = []
+    pcp_group = SimpleNamespace(world_size=2, device_group=object())
+    monkeypatch.setattr(parallel_state, "get_pcp_group", lambda: pcp_group)
+    monkeypatch.setattr(
+        pcp_direct_kv, "pcp_direct_kv_requested", lambda: True
+    )
+    monkeypatch.setattr(
+        pcp_direct_kv,
+        "close_pcp_direct_kv",
+        lambda: events.append("close"),
+    )
+
+    def allocate_backing(_nbytes, _device, _group):
+        events.append("allocate")
+        return SimpleNamespace(storage=torch.empty(1, dtype=torch.int8))
+
+    monkeypatch.setattr(
+        pcp_direct_kv, "allocate_pcp_direct_backing", allocate_backing
+    )
+    monkeypatch.setattr(
+        pcp_direct_kv, "should_allocate_pcp_direct_kv", lambda _config: False
+    )
+
+    def allocate_cache(
+        _config,
+        device,
+        _layout,
+        _kernel_block_sizes,
+        *,
+        buffer_allocator,
+    ):
+        assert buffer_allocator is not None
+        buffer_allocator(1, device)
+        return {}
+
+    monkeypatch.setattr(attn_utils, "allocate_kv_cache", allocate_cache)
+    monkeypatch.setattr(
+        attn_utils, "get_shared_kv_cache_layers", lambda _config: {}
+    )
+    monkeypatch.setattr(attn_utils, "bind_kv_cache", lambda *_args: None)
+
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            get_resolved_kv_cache_layout=lambda: None
+        ),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="test")
+        ),
+    )
+    attn_utils.init_kv_cache(
+        [],
+        {},
+        SimpleNamespace(),
+        torch.device("cpu"),
+        [],
+        config,
+    )
+
+    assert events == ["close", "allocate"]
 
 
 def test_attention_checks_preserve_global_and_target_scoped_support():
