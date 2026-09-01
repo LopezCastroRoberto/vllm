@@ -106,6 +106,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
             step=0,
             query_start_loc_np=input_batch.query_start_loc_np,
+            is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
         )
         return attn_metadata, slot_mappings
 

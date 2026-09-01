@@ -75,8 +75,8 @@ class PCPManager:
         self._use_mtp = use_mtp
 
         self._global_batch: InputBatch | None = None
-        self._replicated_verification = False
-        self._replicated_verification_num_tokens_padded: int | None = None
+        self._replicated_batch = False
+        self._replicated_batch_num_tokens_padded: int | None = None
         self._req_states = req_states
         self._block_tables = block_tables
         self._hidden_restore_idx: torch.Tensor | None = None
@@ -175,8 +175,6 @@ class PCPManager:
                         "draft cache."
                     )
             elif speculative_config.method == "mtp":
-                if parallel_config.decode_context_parallel_size != 1:
-                    raise NotImplementedError("MRV2 PCP MTP does not support DCP yet.")
                 if speculative_config.enable_adaptive_verification:
                     raise NotImplementedError(
                         "MRV2 PCP MTP does not support adaptive verification yet."
@@ -370,6 +368,8 @@ class PCPManager:
         is_prefilling: np.ndarray,
     ) -> int:
         """Return the largest real rank-local batch before graph padding."""
+        if self.dcp_world_size > 1:
+            return int(num_scheduled_tokens.sum())
         return max(
             sum(
                 chunk_len
@@ -385,12 +385,12 @@ class PCPManager:
         assert self._input_buffers is not None
         return self._input_buffers
 
-    def _prepare_replicated_verification(
+    def _prepare_replicated_batch(
         self,
         input_batch: InputBatch,
         padded_num_tokens: int | None,
     ) -> InputBatch:
-        """Keep speculative verification replicated in global token order."""
+        """Keep the target batch replicated in global token order."""
         assert self._input_buffers is not None
         input_buffers = self._input_buffers
         num_tokens = input_batch.num_tokens
@@ -411,14 +411,24 @@ class PCPManager:
         input_buffers.seq_lens[:num_reqs_padded].copy_(input_batch.seq_lens)
 
         dcp_local_seq_lens = None
-        if input_batch.dcp_local_seq_lens is not None:
+        if self.dcp_world_size > 1:
+            prepare_dcp_local_seq_lens(
+                input_buffers.dcp_local_seq_lens,
+                input_buffers.seq_lens,
+                input_batch.num_reqs,
+                self.dcp_world_size,
+                self.dcp_rank,
+                self.cp_interleave,
+            )
+            dcp_local_seq_lens = input_buffers.dcp_local_seq_lens[:num_reqs_padded]
+        elif input_batch.dcp_local_seq_lens is not None:
             input_buffers.dcp_local_seq_lens[:num_reqs_padded].copy_(
                 input_batch.dcp_local_seq_lens
             )
             dcp_local_seq_lens = input_buffers.dcp_local_seq_lens[:num_reqs_padded]
 
-        self._replicated_verification = True
-        self._replicated_verification_num_tokens_padded = num_tokens_padded
+        self._replicated_batch = True
+        self._replicated_batch_num_tokens_padded = num_tokens_padded
         return replace(
             input_batch,
             num_tokens_after_padding=num_tokens_padded,
@@ -442,11 +452,13 @@ class PCPManager:
 
         global_batch = input_batch
         self._global_batch = global_batch
-        self._replicated_verification = False
-        self._replicated_verification_num_tokens_padded = None
+        self._replicated_batch = False
+        self._replicated_batch_num_tokens_padded = None
 
-        if input_batch.num_draft_tokens > 0 and not input_batch.has_prefill:
-            return self._prepare_replicated_verification(input_batch, padded_num_tokens)
+        if self.dcp_world_size > 1 or (
+            input_batch.num_draft_tokens > 0 and not input_batch.has_prefill
+        ):
+            return self._prepare_replicated_batch(input_batch, padded_num_tokens)
 
         num_scheduled_tokens = global_batch.num_scheduled_tokens
         num_computed_tokens = global_batch.num_computed_tokens_np
@@ -702,7 +714,7 @@ class PCPManager:
             out=self._local_block_tables,
             out_ptrs=self._local_block_table_ptrs,
         )
-        if self._replicated_verification:
+        if self._replicated_batch:
             assert self._global_batch_slot_mappings is not None
             assert self._gathered_kv_slot_mappings is not None
             global_slot_mappings = self._block_tables.compute_slot_mappings(
@@ -794,7 +806,7 @@ class PCPManager:
 
     def restore_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert self._global_batch is not None
-        if self._replicated_verification:
+        if self._replicated_batch:
             return hidden_states
         if self._hidden_restore_idx is None:
             return hidden_states
@@ -821,10 +833,10 @@ class PCPManager:
         """Restore a persistent max-token-sized buffer (e.g. the target's
         pre-hc_head residual) by slicing it to the rank-local padded token
         count before the all-gather."""
-        if self._replicated_verification:
+        if self._replicated_batch:
             assert self._global_batch is not None
-            assert self._replicated_verification_num_tokens_padded is not None
-            return hidden_states[: self._replicated_verification_num_tokens_padded]
+            assert self._replicated_batch_num_tokens_padded is not None
+            return hidden_states[: self._replicated_batch_num_tokens_padded]
         assert self._padded_gather_idx is not None
         local_num_tokens_padded = (
             self._padded_gather_idx.shape[0] // self.pcp_world_size

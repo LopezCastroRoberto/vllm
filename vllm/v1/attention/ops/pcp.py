@@ -21,6 +21,11 @@ def _gather_prefill_cache_inputs(
     if num_decode_tokens == local_num_tokens:
         return tensors, slot_mapping[:num_decode_tokens]
 
+    # Sparse MLA may classify a replicated speculative batch as mixed decode
+    # and prefill. Exact-width slots distinguish it from a PCP-expanded layout.
+    if slot_mapping.numel() == local_num_tokens:
+        return tensors, slot_mapping
+
     pcp_group = get_pcp_group()
     gathered_prefills = tuple(
         pcp_group.all_gather(tensor[num_decode_tokens:].contiguous(), dim=0)

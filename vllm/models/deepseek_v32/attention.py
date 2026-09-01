@@ -540,16 +540,8 @@ class DeepseekV32Attention(MLAAttention):
 
         if self.use_pcp and self.impl.dcp_world_size > 1:
             assert lse is not None and self.dcp_manager is not None
-            seq_lens = (
-                attn_metadata.decode.seq_lens
-                if attn_metadata.decode is not None
-                else cast(torch.Tensor, attn_metadata.seq_lens)[  # type: ignore[attr-defined]
-                    : attn_metadata.num_decodes
-                ]
-            )
-            query_start_loc = attn_metadata.query_start_loc[
-                : attn_metadata.num_decodes + 1
-            ]
+            seq_lens = cast(torch.Tensor, attn_metadata.seq_lens)  # type: ignore[attr-defined]
+            query_start_loc = attn_metadata.query_start_loc
             attn_out = self.dcp_manager.combine(
                 attn_out,
                 lse,

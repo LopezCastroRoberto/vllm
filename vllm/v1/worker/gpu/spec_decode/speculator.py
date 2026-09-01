@@ -81,7 +81,10 @@ class DraftModelSpeculator(BaseSpeculator):
             and speculative_config is not None
             and (speculative_config.method == "mtp" or speculative_config.use_dspark())
         )
-        if self.replicated_pcp:
+        if (
+            self.replicated_pcp
+            and target_parallel_config.decode_context_parallel_size == 1
+        ):
             vllm_config = replace(
                 vllm_config,
                 parallel_config=replace(
@@ -237,6 +240,7 @@ class DraftModelSpeculator(BaseSpeculator):
             self.attn_vllm_config,
             self.device,
             active_layer_names=self.draft_attn_layer_names,
+            kernel_block_sizes=block_tables.kernel_block_sizes,
         )
         self.block_tables = block_tables
         # The target model runner's buffers and attention groups. Draft
@@ -257,6 +261,7 @@ class DraftModelSpeculator(BaseSpeculator):
         causal: bool | Mapping[int, bool] = True,
         query_start_loc_np: np.ndarray | None = None,
         dcp_local_seq_lens: torch.Tensor | None = None,
+        is_prefilling: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
         if query_start_loc_np is not None:
             # Non-uniform query layout (e.g. multi-module MTP's mixed
@@ -291,6 +296,8 @@ class DraftModelSpeculator(BaseSpeculator):
             out=draft_seq_lens_cpu_upper_bound[:num_reqs],
         )
         draft_seq_lens_cpu_upper_bound[:num_reqs].clamp_(max=self.max_model_len)
+        if is_prefilling is None and self.replicated_pcp:
+            is_prefilling = torch.zeros(num_reqs_padded, dtype=torch.bool)
         attn_metadata = build_attn_metadata(
             attn_groups=self.attn_groups,
             num_reqs=num_reqs_padded,
@@ -312,6 +319,7 @@ class DraftModelSpeculator(BaseSpeculator):
             kv_cache_config=self.kv_cache_config,
             causal=causal,
             seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
+            is_prefilling=is_prefilling,
         )
         return attn_metadata
 
