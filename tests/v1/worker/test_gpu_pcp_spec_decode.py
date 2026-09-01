@@ -226,3 +226,63 @@ def test_restore_hidden_states_appends_zero_graph_padding(monkeypatch):
     assert actual.shape == (8, 2)
     torch.testing.assert_close(actual[:5], restored)
     torch.testing.assert_close(actual[5:], torch.zeros(3, 2))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mixed_spec_partition_preserves_materialized_draft_inputs(monkeypatch):
+    device = torch.device("cuda")
+    global_buffers = InputBuffers(max_num_reqs=2, max_num_tokens=8, device=device)
+    global_batch = InputBatch.make_dummy(
+        num_reqs=2,
+        num_tokens=6,
+        input_buffers=global_buffers,
+    )
+    global_batch.num_draft_tokens = 1
+    global_batch.num_draft_tokens_per_req = np.array([1, 0], dtype=np.int32)
+    global_batch.num_scheduled_tokens[:] = [2, 4]
+    global_batch.query_start_loc.copy_(torch.tensor([0, 2, 6], device=device))
+    global_batch.query_start_loc_np[:] = [0, 2, 6]
+    global_batch.num_computed_tokens_np[:] = [10, 0]
+    global_batch.prefill_len_np[:] = [5, 4]
+    global_batch.num_computed_prefill_tokens_np[:] = [5, 0]
+    global_batch.is_prefilling_np[:] = [False, True]
+    global_batch.has_prefill = True
+    global_batch.seq_lens.copy_(torch.tensor([12, 4], device=device))
+    global_batch.input_ids.copy_(
+        torch.tensor([101, 102, 201, 202, 203, 204], device=device)
+    )
+
+    req_states = SimpleNamespace(
+        last_sampled_tokens=torch.tensor([999, 998], device=device),
+        prefill_len=SimpleNamespace(gpu=torch.tensor([5, 4], device=device)),
+        draft_tokens=torch.tensor([[888], [0]], device=device),
+    )
+    manager = PCPManager(
+        pcp_world_size=4,
+        pcp_rank=0,
+        device=device,
+        req_states=req_states,
+        max_num_reqs=2,
+        max_num_tokens=8,
+    )
+
+    def fail_recombine(*_args, **_kwargs):
+        raise AssertionError(
+            "mixed speculative inputs were already materialized globally"
+        )
+
+    monkeypatch.setattr(
+        pcp_manager_module,
+        "combine_sampled_and_draft_tokens",
+        fail_recombine,
+    )
+    local_batch = manager.partition_batch(global_batch)
+
+    # The replicated decode segment remains first after PCP segment ordering.
+    # Its [last-sampled, draft] rows must survive partitioning unchanged.
+    torch.testing.assert_close(
+        local_batch.input_ids[:2],
+        torch.tensor(
+            [101, 102], device=device, dtype=local_batch.input_ids.dtype
+        ),
+    )
