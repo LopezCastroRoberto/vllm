@@ -15,6 +15,27 @@ INDEXER_LAYER = "model.layers.0.self_attn.indexer.k_cache"
 MLA_LAYER = "model.layers.0.self_attn.attn"
 
 
+@pytest.mark.parametrize(
+    ("k_tokens", "slot_tokens", "expected_tokens"),
+    [
+        (4, 16, 4),
+        (8, 8, 8),
+        (16, 8, 8),
+    ],
+)
+def test_narrow_indexer_k_distinguishes_pcp_and_replicated_slots(
+    k_tokens: int, slot_tokens: int, expected_tokens: int
+):
+    k = torch.empty(k_tokens, 4)
+    slot_mapping = torch.empty(slot_tokens, dtype=torch.long)
+
+    actual = sparse_indexer._narrow_indexer_k_to_slot_layout(
+        k, slot_mapping, use_pcp=True, pcp_world_size=4
+    )
+
+    assert actual.shape[0] == expected_tokens
+
+
 def make_indexer_metadata(
     *,
     num_decodes: int = 0,

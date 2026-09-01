@@ -166,7 +166,6 @@ class PCPManager:
         if vllm_config.lora_config is not None:
             raise NotImplementedError("MRV2 PCP does not support LoRA yet.")
         speculative_config = vllm_config.speculative_config
-        is_sparse_mla = hasattr(model_config.hf_text_config, "index_topk")
         if speculative_config is not None:
             if speculative_config.use_dspark():
                 if not envs.VLLM_USE_PCP_DIRECT_KV:
@@ -176,10 +175,6 @@ class PCPManager:
                         "draft cache."
                     )
             elif speculative_config.method == "mtp":
-                if is_sparse_mla:
-                    raise NotImplementedError(
-                        "MRV2 PCP MTP currently supports dense MLA only."
-                    )
                 if parallel_config.decode_context_parallel_size != 1:
                     raise NotImplementedError("MRV2 PCP MTP does not support DCP yet.")
                 if speculative_config.enable_adaptive_verification:
@@ -451,9 +446,7 @@ class PCPManager:
         self._replicated_verification_num_tokens_padded = None
 
         if input_batch.num_draft_tokens > 0 and not input_batch.has_prefill:
-            return self._prepare_replicated_verification(
-                input_batch, padded_num_tokens
-            )
+            return self._prepare_replicated_verification(input_batch, padded_num_tokens)
 
         num_scheduled_tokens = global_batch.num_scheduled_tokens
         num_computed_tokens = global_batch.num_computed_tokens_np
