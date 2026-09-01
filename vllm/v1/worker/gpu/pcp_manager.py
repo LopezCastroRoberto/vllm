@@ -162,6 +162,21 @@ class PCPManager:
 
         return self._direct_kv_requested and pcp_direct_kv_active()
 
+    @property
+    def peer_kv_enabled(self) -> bool:
+        """Whether any PCP peer cache view (replicated or DCP-sharded) is active.
+
+        Unlike ``direct_kv_enabled`` (replicated-to-every-peer only), this is
+        True in DCP-sharded mode as well, so it correctly gates work that must
+        run whenever peer KV is available in any layout (e.g. the DSpark
+        context-KV precompute).
+        """
+        from vllm.model_executor.layers.attention.pcp_direct_kv import (
+            pcp_peer_kv_active,
+        )
+
+        return pcp_peer_kv_active()
+
     @staticmethod
     def validate_config(
         vllm_config: VllmConfig,
@@ -189,20 +204,17 @@ class PCPManager:
         is_sparse_mla = hasattr(model_config.hf_text_config, "index_topk")
         if speculative_config is not None:
             if speculative_config.use_dspark():
-                # With TP1 and DCP spanning the complete PCP group, each PCP
-                # rank already owns the matching DCP KV shard.  Publishing
-                # every shard to every PCP peer is unnecessary (and would
-                # overwrite peer-local DCP slots).  Other PCP layouts still
-                # need the direct-KV replication path for DSpark.
-                dcp_spans_pcp = (
-                    parallel_config.tensor_parallel_size == 1
-                    and parallel_config.decode_context_parallel_size == pcp_size
-                )
-                if not envs.VLLM_USE_PCP_DIRECT_KV and not dcp_spans_pcp:
+                # DSpark with PCP always needs the direct/peer KV path: prefill
+                # context KV must be published to (and, under DCP sharding, read
+                # back from) every PCP peer via symmetric memory.  Without it the
+                # DSpark context-KV precompute is skipped and each rank drafts
+                # from an incomplete context.  Require it explicitly rather than
+                # letting a silently-broken config start.
+                if not envs.VLLM_USE_PCP_DIRECT_KV:
                     raise NotImplementedError(
                         "DSpark with PCP requires VLLM_USE_PCP_DIRECT_KV=1 so "
-                        "sharded prefill context KV can be published to every "
-                        "draft cache."
+                        "prefill context KV can be published to / read from "
+                        "every PCP peer's draft cache."
                     )
             elif speculative_config.method == "mtp":
                 if is_sparse_mla:
