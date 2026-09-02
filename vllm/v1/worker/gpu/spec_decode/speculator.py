@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models import supports_multimodal_embeddings
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
@@ -91,6 +92,24 @@ class DraftModelSpeculator(BaseSpeculator):
                 parallel_config=replace(
                     target_parallel_config,
                     prefill_context_parallel_size=1,
+                ),
+            )
+        # fp8_ds_mla describes the target MLA cache's packed physical layout.
+        # DFlash/DSpark drafts use standard K/V attention, so carrying that
+        # target-only layout into the draft makes every standard attention
+        # backend reject the cache configuration. Keep the target config
+        # untouched and use the equivalent standard FP8 cache for the draft.
+        if (
+            speculative_config is not None
+            and speculative_config.use_dspark()
+            and vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+        ):
+            vllm_config = replace(
+                vllm_config,
+                cache_config=replace(vllm_config.cache_config, cache_dtype="fp8"),
+                attention_config=replace(
+                    vllm_config.attention_config,
+                    disable_flashinfer_q_quantization=True,
                 ),
             )
         self.vllm_config = vllm_config
@@ -236,6 +255,13 @@ class DraftModelSpeculator(BaseSpeculator):
     ) -> None:
         self.model_state = model_state
         self.kv_cache_config = kv_cache_config
+        if kv_cache_config.kv_cache_layout is not None:
+            # The engine resolves layout after the draft-local CacheConfig copy
+            # is created. Mirror that physical layout while keeping the draft's
+            # standard FP8 dtype independent from the target MLA cache dtype.
+            record_kv_cache_layout(
+                self.vllm_config.cache_config, kv_cache_config.kv_cache_layout
+            )
         self.attn_groups, self.attn_cg_support, _ = init_attn_backend(
             kv_cache_config,
             self.attn_vllm_config,

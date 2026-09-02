@@ -711,6 +711,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.model_config.max_model_len, self.kv_cache_spec.block_size
         )
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+        # PCP DualChunkSwap can represent each logical prefill request as two
+        # rank-local segments. Metadata builders therefore see up to twice the
+        # scheduler's logical request limit during the shared prepare pass.
+        if vllm_config.parallel_config.prefill_context_parallel_size > 1:
+            max_num_reqs *= 2
         self.max_num_reqs = max_num_reqs
         max_num_pages = max_num_reqs * max_num_pages_per_req
         # Persistent uniform masks keep stable addresses for CUDA graphs.
@@ -763,6 +768,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         if self.kv_cache_spec.kv_quant_mode != KVQuantMode.NONE:
             self.cache_dtype = self.cache_config.cache_dtype
+            # fp8_ds_mla names the packed target MLA cache layout. A standard
+            # attention group (for example a DFlash/DSpark draft) still has a
+            # regular FP8 K/V spec even when it shares the target's top-level
+            # CacheConfig, so FlashInfer must interpret that group as FP8.
+            if self.cache_dtype == "fp8_ds_mla":
+                self.cache_dtype = "fp8"
             # Cannot use self.kv_cache_spec.dtype here because kv_cache_spec
             # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
             self.is_kvcache_nvfp4 = self.cache_dtype.startswith("nvfp4")
@@ -940,6 +951,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # The user sets --attention-config.disable_flashinfer_q_quantization
         # to 1 explicitly, use model dtype for query.
         if self.vllm_config.attention_config.disable_flashinfer_q_quantization:
+            return self.model_config.dtype
+
+        # Standard FlashInfer DCP prefill uses the native FA2 wrapper because
+        # the TRTLLM prefill path is not CP-aware. FA2 can read an FP8 KV cache
+        # but does not support FP8 tensor-core queries, so keep Q in the model
+        # dtype while retaining FP8 cache storage.
+        if is_prefill and self.use_dcp and self.cache_dtype.startswith("fp8"):
             return self.model_config.dtype
 
         # self.cache_dtype is resolved per KV-cache group: it is "auto" when
