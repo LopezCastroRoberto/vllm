@@ -9,7 +9,7 @@ from transformers import DeepseekV2Config, DeepseekV3Config
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.parallel_state import get_pcp_group, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.attention.attention import get_attention_context
@@ -566,6 +566,14 @@ class DeepseekV32Attention(MLAAttention):
             return
         attn_metadata = cast("MLACommonMetadata", attn_metadata)
 
+        # The PCP manager only attaches the global request map when prefill
+        # query rows are actually token-sharded. Pure decode and replicated
+        # speculative verification must stay on the normal DCP path even when
+        # PCP and DCP happen to have the same world size.
+        pcp_token_sharded = (
+            getattr(attn_metadata, "pcp_gathered_req_id", None) is not None
+        )
+
         if self.use_pcp and not pcp_direct_kv_active():
             assert kv_c is not None and k_pe is not None
             kv_for_cache, kpe_for_cache, cache_slot_mapping = (
@@ -587,7 +595,9 @@ class DeepseekV32Attention(MLAAttention):
             )
 
         num_actual = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
-        if num_actual == 0:
+        # DCP spanning the PCP group: every rank must join the token-gather
+        # collectives even when it holds no tokens this step.
+        if num_actual == 0 and not pcp_token_sharded:
             output.zero_()
             return
 
@@ -600,6 +610,35 @@ class DeepseekV32Attention(MLAAttention):
             ]
         else:
             mqa_q_arg = (ql_nope[:num_actual], mqa_q[:num_actual])
+
+        if pcp_token_sharded:
+            # DCP spans the PCP group: queries are token-partitioned and the KV
+            # cache is block-sharded, so gather along tokens, attend to the local
+            # shard and reduce-scatter the LSE-merged output (no head gather).
+            pcp_group = get_pcp_group()
+            num_padded = layer_slot_mapping.shape[0] // pcp_group.world_size
+            if self._fp8_query:
+                mqa_q_full: torch.Tensor | tuple[torch.Tensor, torch.Tensor] = mqa_q[
+                    :num_padded
+                ]
+            else:
+                mqa_q_full = (ql_nope[:num_padded], mqa_q[:num_padded])
+            attn_out = self.impl.forward_mqa_token_sharded(  # type: ignore[attr-defined]
+                mqa_q_full,
+                kv_cache,
+                attn_metadata,
+                pcp_group,
+                num_padded,
+                w_uv=self.W_UV,
+            )
+            # Already projected through W_UV (before the cross-rank merge).
+            if num_actual > 0:
+                output[:num_actual].view(
+                    num_actual, self.num_local_heads, self.v_head_dim
+                ).copy_(attn_out)
+            if num_actual < output.shape[0]:
+                output[num_actual:].zero_()
+            return
 
         if self.use_pcp and self.impl.dcp_world_size > self.impl.pcp_world_size:
             if isinstance(mqa_q_arg, tuple):
