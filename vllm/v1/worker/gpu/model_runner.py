@@ -1869,7 +1869,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         if (
             self.pcp_manager is not None
-            and self.pcp_manager.direct_kv_enabled
+            and self.pcp_manager.peer_kv_enabled
             and isinstance(self.speculator, DSparkSpeculator)
             and self.speculative_config is not None
             and self.speculative_config.method == "dspark"
