@@ -480,7 +480,19 @@ class PCPManager:
         self,
         input_batch: InputBatch,
         padded_num_tokens: int | None = None,
+        *,
+        adaptive_verification: bool = False,
     ) -> InputBatch:
+        if (
+            adaptive_verification
+            and input_batch.num_draft_tokens > 0
+            and input_batch.has_prefill
+        ):
+            raise NotImplementedError(
+                "PCP does not yet support adaptive speculative verification in "
+                "a mixed prefill/decode batch; use a disaggregated decoder or "
+                "disable adaptive verification."
+            )
         assert self._req_states is not None
         assert self._input_buffers is not None
         req_states = self._req_states
@@ -891,12 +903,14 @@ def maybe_partition_pcp_batch(
     manager: PCPManager | None,
     input_batch: InputBatch,
     padded_num_tokens: int | None = None,
+    adaptive_verification: bool = False,
 ) -> InputBatch:
     if manager is None:
         return input_batch
     return manager.partition_batch(
         input_batch,
         padded_num_tokens=padded_num_tokens,
+        adaptive_verification=adaptive_verification,
     )
 
 

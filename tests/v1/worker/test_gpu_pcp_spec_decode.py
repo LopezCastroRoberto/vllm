@@ -286,3 +286,31 @@ def test_mixed_spec_partition_preserves_materialized_draft_inputs(monkeypatch):
             [101, 102], device=device, dtype=local_batch.input_ids.dtype
         ),
     )
+
+
+def test_adaptive_mixed_spec_batch_is_rejected():
+    device = torch.device("cpu")
+    global_buffers = InputBuffers(max_num_reqs=2, max_num_tokens=8, device=device)
+    global_batch = InputBatch.make_dummy(
+        num_reqs=2,
+        num_tokens=6,
+        input_buffers=global_buffers,
+    )
+    global_batch.num_draft_tokens = 1
+    global_batch.num_draft_tokens_per_req = np.array([1, 0], dtype=np.int32)
+    global_batch.has_prefill = True
+
+    manager = PCPManager(
+        pcp_world_size=4,
+        pcp_rank=0,
+        device=device,
+    )
+
+    with pytest.raises(
+        NotImplementedError,
+        match="adaptive speculative verification in a mixed prefill/decode batch",
+    ):
+        manager.partition_batch(
+            global_batch,
+            adaptive_verification=True,
+        )

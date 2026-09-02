@@ -835,6 +835,13 @@ class Worker(WorkerBase):
         if self.use_v2_model_runner and not skip_v2_warmup:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+            # Synthetic PCP direct-KV traffic must not leak its device epoch
+            # into the first scheduler-owned batch.
+            from vllm.model_executor.layers.attention.pcp_direct_kv import (
+                reset_pcp_peer_cache_fence,
+            )
+
+            reset_pcp_peer_cache_fence()
         elif skip_v2_warmup:
             # A disaggregated PCP prefiller never executes decode or sampling.
             # The scheduler-realistic V2 warmup includes both and can deadlock
