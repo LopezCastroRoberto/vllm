@@ -687,7 +687,8 @@ class DFlashQwen3Model(nn.Module):
                     attn.layer_name,
                     kv_cache,
                     slot_mapping,
-                    kv_cache.shape[1],
+                    token_dim=2,
+                    segment_dim=1,
                 )
         if publish_to_pcp:
             if not stored_rows:
