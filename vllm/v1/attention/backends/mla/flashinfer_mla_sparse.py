@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, ClassVar
 import torch
 
 from vllm import envs
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.logger import init_logger
@@ -32,7 +32,11 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
     triton_filter_and_convert_dcp_index,
 )
-from vllm.v1.attention.ops.dcp import CPTritonContext, correct_attn_out
+from vllm.v1.attention.ops.dcp import (
+    CPTritonContext,
+    correct_attn_out,
+    dcp_a2a_lse_reduce_token_sharded,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 if TYPE_CHECKING:
@@ -387,6 +391,9 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         self._workspace_buffer: torch.Tensor | None = None
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
+        self.dcp_comm_backend = (
+            get_current_vllm_config().parallel_config.dcp_comm_backend
+        )
 
         # fp8 query quantization is required when using fp8 kv_cache,
         # as the TRTLLM-GEN sparse MLA kernel requires matching dtypes
@@ -606,17 +613,28 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 .transpose(0, 1)
                 .contiguous()
             )
-            lses = cp_group.all_gather(lse.contiguous(), dim=0).view(
-                world_size, num_all, num_heads
-            )
-            partial, _ = correct_attn_out(
-                partial,
-                lses,
-                cp_group.rank_in_group,
-                cp_ctx,
-                is_lse_base_on_e=self.lse_base_on_e,
-            )
-            out_chunks.append(cp_group.reduce_scatter(partial, dim=0))
+            if self.dcp_comm_backend == "a2a":
+                out_chunks.append(
+                    dcp_a2a_lse_reduce_token_sharded(
+                        partial,
+                        lse,
+                        cp_group,
+                        is_lse_base_on_e=self.lse_base_on_e,
+                    )
+                )
+            else:
+                assert self.dcp_comm_backend == "ag_rs"
+                lses = cp_group.all_gather(lse.contiguous(), dim=0).view(
+                    world_size, num_all, num_heads
+                )
+                partial, _ = correct_attn_out(
+                    partial,
+                    lses,
+                    cp_group.rank_in_group,
+                    cp_ctx,
+                    is_lse_base_on_e=self.lse_base_on_e,
+                )
+                out_chunks.append(cp_group.reduce_scatter(partial, dim=0))
 
         local_out = out_chunks[0] if len(out_chunks) == 1 else torch.cat(out_chunks)
         return local_out[:num_actual]
