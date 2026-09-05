@@ -254,6 +254,13 @@ class PCPDirectKVState:
 
 
 _STATE = PCPDirectKVState()
+import os as _os_dbg  # __PCP_DBG_INSTRUMENT__
+_PCP_DBG = bool(_os_dbg.environ.get("PCP_FENCE_DEBUG"))
+_DBG = {"sharded": 0, "direct": 0, "lines": 0}
+def _dbg_on():
+    return _PCP_DBG and _os_dbg.path.exists("/tmp/PCP_DBG_ON")
+def _pcp_dbg_snapshot():
+    return (_STATE.rank, _DBG["sharded"], _DBG["direct"])
 
 
 def pcp_direct_kv_requested() -> bool:
@@ -453,12 +460,26 @@ def publish_pcp_cache_rows(
 def publish_pcp_direct_kv() -> None:
     if pcp_direct_kv_active() and _STATE.fence is not None:
         _STATE.fence()
+        _DBG["direct"] += 1  # __PCP_DBG_INSTRUMENT__
+        if _dbg_on():
+            print(f"[FENCE-DIRECT rank={_STATE.rank} n={_DBG['direct']}"
+                  f" cap={_torch_cap()}]", flush=True)
 
 
+def _torch_cap():  # __PCP_DBG_INSTRUMENT__
+    try:
+        import torch as _t
+        return _t.cuda.is_current_stream_capturing()
+    except Exception:
+        return "?"
 def publish_pcp_sharded_peer_kv() -> None:
     """Publish local DCP cache writes before asynchronous peer reads."""
     if pcp_sharded_peer_kv_active() and _STATE.fence is not None:
         _STATE.fence()
+        _DBG["sharded"] += 1  # __PCP_DBG_INSTRUMENT__
+        if _dbg_on():
+            print(f"[FENCE-SHARDED rank={_STATE.rank} n={_DBG['sharded']}"
+                  f" cap={_torch_cap()}]", flush=True)
 
 
 def reset_pcp_peer_cache_fence() -> None:
