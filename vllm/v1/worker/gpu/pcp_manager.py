@@ -103,6 +103,7 @@ class PCPManager:
         self._block_tables = block_tables
         self._hidden_restore_idx: torch.Tensor | None = None
         self._padded_gather_idx: torch.Tensor | None = None
+        self._gathered_query_valid_mask: torch.Tensor | None = None
         self._gathered_kv_write_mask: torch.Tensor | None = None
         self._pad_slot_id = torch.tensor(PAD_SLOT_ID, dtype=torch.int64, device=device)
 
@@ -378,6 +379,7 @@ class PCPManager:
             )
         num_expanded_tokens = padded_num_tokens * self.pcp_world_size
         padded_gather_idx = np.zeros(num_expanded_tokens, dtype=np.int64)
+        gathered_query_valid_mask = np.zeros(num_expanded_tokens, dtype=np.bool_)
         gathered_kv_write_mask = np.zeros(num_expanded_tokens, dtype=np.bool_)
         for rank, segments in enumerate(segments_by_rank):
             expanded_rank_offset = rank * padded_num_tokens
@@ -391,6 +393,7 @@ class PCPManager:
                     segment.global_batch_slice.stop,
                     dtype=np.int64,
                 )
+                gathered_query_valid_mask[padded_gathered_slice] = True
                 # Cache insertion pairs one slot entry with each rank's local decode.
                 if not bool(is_prefilling[segment.global_batch_req_idx]) and rank != 0:
                     continue
@@ -406,6 +409,9 @@ class PCPManager:
         )
         self._padded_gather_idx = async_copy_to_gpu(
             padded_gather_idx, device=self.device
+        )
+        self._gathered_query_valid_mask = async_copy_to_gpu(
+            gathered_query_valid_mask, device=self.device
         )
         self._gathered_kv_write_mask = async_copy_to_gpu(
             gathered_kv_write_mask, device=self.device
@@ -875,9 +881,9 @@ class PCPManager:
             or self._global_batch is None
             or self._padded_gather_idx is None
             or self._hidden_restore_idx is None
+            or self._gathered_query_valid_mask is None
             or self._replicated_verification
             or not input_batch.has_prefill
-            or not bool(self._global_batch.is_prefilling_np.all())
         ):
             return attn_metadata
         if dummy_run:
@@ -942,23 +948,21 @@ class PCPManager:
             global_req_id = torch.nn.functional.pad(
                 global_req_id, (0, num_global_tokens - global_req_id.shape[0])
             )
-        gathered_req_id = global_req_id[self._padded_gather_idx]
         for i, groups in enumerate(sparse_mla_groups):
             for g in groups:
                 for layer_name in g.layer_names:
                     meta = attn_metadata.get(layer_name)
                     if meta is None:
                         continue
-                    meta.pcp_gathered_req_id = gathered_req_id
+                    meta.pcp_global_req_id = global_req_id
+                    meta.pcp_gather_idx = self._padded_gather_idx
+                    meta.pcp_gather_valid_mask = self._gathered_query_valid_mask
                     meta.pcp_global_block_table = block_tables[i]
         if not any(indexer_groups):
             return attn_metadata
-        start = self.pcp_rank * num_padded
-        local_rows = self._padded_gather_idx[start : start + input_batch.num_tokens]
         for layer_name, meta in global_metadata.items():
             meta.pcp_num_padded = num_padded
             meta.pcp_restore_idx = self._hidden_restore_idx
-            meta.pcp_local_rows = local_rows
             meta.pcp_gathered_slot_mapping = attn_metadata[layer_name].slot_mapping
             attn_metadata[layer_name] = meta
         return attn_metadata

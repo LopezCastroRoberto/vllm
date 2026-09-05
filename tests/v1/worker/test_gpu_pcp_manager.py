@@ -47,8 +47,51 @@ def test_replicated_decode_piecewise_graph_padding(monkeypatch):
         torch.tensor([0, 1, 2, 0, 0, 1, 2, 0]),
     )
     assert torch.equal(
+        manager._gathered_query_valid_mask,
+        torch.tensor([True, True, True, False, True, True, True, False]),
+    )
+    assert torch.equal(
         manager._gathered_kv_write_mask,
         torch.tensor([True, True, True, False, False, False, False, False]),
+    )
+
+
+def test_mixed_layout_separates_query_rows_from_cache_writers(monkeypatch):
+    manager = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        dcp_world_size=2,
+    )
+    monkeypatch.setattr(pcp_manager_module, "async_copy_to_gpu", _copy_to_cpu)
+
+    manager._build_batch_layout(
+        num_scheduled_tokens=np.array([1, 4], dtype=np.int32),
+        num_computed_tokens=np.array([16, 0], dtype=np.int32),
+        is_prefilling=np.array([False, True]),
+        query_start_loc_np=np.array([0, 1, 5], dtype=np.int32),
+        padded_num_tokens=3,
+    )
+
+    # Decode row 0 is replicated and must be a valid query on both ranks so
+    # each rank contributes its DCP KV shard. Only rank 0 writes its cache row.
+    assert torch.equal(
+        manager._gathered_query_valid_mask,
+        torch.tensor([True, True, True, True, True, True]),
+    )
+    assert torch.equal(
+        manager._gathered_kv_write_mask,
+        torch.tensor([True, True, True, False, True, True]),
+    )
+    # Both rank-major copies of the decode row map to global row 0; the
+    # sharded prefill rows cover global rows 1..4 exactly once.
+    assert torch.equal(
+        manager._padded_gather_idx,
+        torch.tensor([0, 4, 1, 0, 2, 3]),
+    )
+    assert torch.equal(
+        manager._hidden_restore_idx,
+        torch.tensor([0, 2, 4, 5, 1]),
     )
 
 

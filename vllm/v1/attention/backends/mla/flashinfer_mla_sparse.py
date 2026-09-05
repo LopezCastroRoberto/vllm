@@ -242,8 +242,11 @@ class FlashInferMLASparseMetadata(AttentionMetadata):
 
     # Rank-major padded query ownership and the global request block table for
     # PCP-token-sharded DCP attention. None for capture/dummy batches.
-    pcp_gathered_req_id: torch.Tensor | None = None
+    pcp_global_req_id: torch.Tensor | None = None
+    pcp_gather_idx: torch.Tensor | None = None
+    pcp_gather_valid_mask: torch.Tensor | None = None
     pcp_global_block_table: torch.Tensor | None = None
+
 
 class FlashInferMLASparseMetadataBuilder(
     SparseMLACommonMetadataBuilder[FlashInferMLASparseMetadata]
@@ -399,59 +402,55 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         attn_metadata: FlashInferMLASparseMetadata,
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-            if self._workspace_buffer is None:
-                self._workspace_buffer = _get_workspace_buffer(q.device)
+        if self._workspace_buffer is None:
+            self._workspace_buffer = _get_workspace_buffer(q.device)
 
-            if self.bmm1_scale is None:
-                self.bmm1_scale = self.scale
-                if is_quantized_kv_cache(self.kv_cache_dtype):
-                    self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
-            if self.bmm2_scale is None:
-                self.bmm2_scale = 1.0
-                if is_quantized_kv_cache(self.kv_cache_dtype):
-                    self.bmm2_scale *= layer._k_scale_float
+        if self.bmm1_scale is None:
+            self.bmm1_scale = self.scale
+            if is_quantized_kv_cache(self.kv_cache_dtype):
+                self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
+        if self.bmm2_scale is None:
+            self.bmm2_scale = 1.0
+            if is_quantized_kv_cache(self.kv_cache_dtype):
+                self.bmm2_scale *= layer._k_scale_float
 
-            from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
+        from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
 
-            # Single-token sparse decode. trtllm-gen requires the q_len_per_request
-            # dim, but the sparse attention mask is fully per-token (each query token
-            # carries its own top-k index row), so unsqueeze is sufficient and
-            # correct. The MTP/multi-token q_len grouping is a perf-only layout and is
-            # deferred until MTP is validated end-to-end for this backend.
-            query = q.unsqueeze(1)
-            block_tables = topk_indices_physical.unsqueeze(1)
-            seq_lens_arg = seq_lens
+        # Sparse attention is fully per-token: each query token carries its
+        # own top-k row, so a singleton request dimension is sufficient.
+        query = q.unsqueeze(1)
+        block_tables = topk_indices_physical.unsqueeze(1)
 
-            kernel_out = trtllm_batch_decode_with_kv_cache_mla(
-                query=query,
-                kv_cache=kv_c_and_k_pe_cache.unsqueeze(1),
-                workspace_buffer=self._workspace_buffer,
-                qk_nope_head_dim=self.qk_nope_head_dim,
-                kv_lora_rank=self.kv_lora_rank,
-                qk_rope_head_dim=self.qk_rope_head_dim,
-                block_tables=block_tables,
-                seq_lens=seq_lens_arg,
-                max_seq_len=attn_metadata.topk_tokens,
-                bmm1_scale=self.bmm1_scale,
-                bmm2_scale=self.bmm2_scale,
-                sparse_mla_top_k=attn_metadata.topk_tokens,
-                return_lse=self.need_to_return_lse_for_decode,
-            )
-            if self.need_to_return_lse_for_decode:
-                assert isinstance(kernel_out, tuple)
-                o, lse = kernel_out
-            else:
-                assert isinstance(kernel_out, torch.Tensor)
-                o = kernel_out
-                lse = None
+        kernel_out = trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_c_and_k_pe_cache.unsqueeze(1),
+            workspace_buffer=self._workspace_buffer,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=attn_metadata.topk_tokens,
+            bmm1_scale=self.bmm1_scale,
+            bmm2_scale=self.bmm2_scale,
+            sparse_mla_top_k=attn_metadata.topk_tokens,
+            return_lse=self.need_to_return_lse_for_decode,
+        )
+        if self.need_to_return_lse_for_decode:
+            assert isinstance(kernel_out, tuple)
+            o, lse = kernel_out
+        else:
+            assert isinstance(kernel_out, torch.Tensor)
+            o = kernel_out
+            lse = None
 
-            out = o.view(-1, o.shape[-2], o.shape[-1])
-            if lse is not None:
-                lse = self._normalize_lse(lse, out.shape[0], out.shape[1])
-                empty_rows = (topk_indices_physical == -1).all(dim=-1)
-                out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
-                lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
-            return out, lse
+        out = o.view(-1, o.shape[-2], o.shape[-1])
+        if lse is not None:
+            lse = self._normalize_lse(lse, out.shape[0], out.shape[1])
+            empty_rows = (topk_indices_physical == -1).all(dim=-1)
+            out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
+            lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
+        return out, lse
 
     def forward_mqa(
         self,
@@ -540,9 +539,16 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         assert q.shape[0] >= num_padded_tokens >= num_actual
         assert self.topk_indices_buffer is not None
 
-        gathered_req_id = attn_metadata.pcp_gathered_req_id
+        global_req_id = attn_metadata.pcp_global_req_id
+        gather_idx = attn_metadata.pcp_gather_idx
+        gather_valid_mask = attn_metadata.pcp_gather_valid_mask
         global_block_table = attn_metadata.pcp_global_block_table
-        if gathered_req_id is None or global_block_table is None:
+        if (
+            global_req_id is None
+            or gather_idx is None
+            or gather_valid_mask is None
+            or global_block_table is None
+        ):
             # Capture/profiling batches have no runtime global PCP maps. Execute
             # a local shape-equivalent kernel; the eager segment is re-run with
             # real metadata at replay.
@@ -557,46 +563,34 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
 
         world_size = cp_group.world_size
         num_heads = q.shape[1]
-        topk_local = self.topk_indices_buffer[:num_padded_tokens]
-        if num_actual < num_padded_tokens:
-            topk_local[num_actual:].fill_(-1)
-        gathered_req_id = gathered_req_id.view(world_size, num_padded_tokens)
+        topk_global = self.topk_indices_buffer
+        gather_idx = gather_idx.view(world_size, num_padded_tokens)
+        gather_valid_mask = gather_valid_mask.view(world_size, num_padded_tokens)
         out_chunks: list[torch.Tensor] = []
+        cp_ctx = CPTritonContext()
 
         for start in range(0, num_padded_tokens, self.TOKEN_SHARDED_ROWS_PER_RANK):
             stop = min(start + self.TOKEN_SHARDED_ROWS_PER_RANK, num_padded_tokens)
             rows = stop - start
-            q_bytes = q[start:stop].reshape(rows, -1).view(torch.uint8)
-            topk_bytes = topk_local[start:stop].contiguous().view(torch.uint8)
-            packed = torch.cat((q_bytes, topk_bytes), dim=1)
-            packed_all = cp_group.all_gather(packed, dim=0)
             num_all = rows * world_size
-            q_all = (
-                packed_all[:, : q_bytes.shape[1]]
-                .contiguous()
-                .view(q.dtype)
-                .view(num_all, num_heads, q.shape[-1])
-            )
-            topk_all = (
-                packed_all[:, q_bytes.shape[1] :]
-                .contiguous()
-                .view(torch.int32)
-                .view(num_all, topk_local.shape[1])
-            )
-            req_all = gathered_req_id[:, start:stop].reshape(-1).contiguous()
+            q_all = cp_group.all_gather(q[start:stop], dim=0)
+            gathered_rows = gather_idx[:, start:stop].flatten()
+            valid_rows = gather_valid_mask[:, start:stop].flatten()
             physical, valid_counts = triton_filter_and_convert_dcp_index(
-                req_all,
+                global_req_id,
                 global_block_table,
-                topk_all,
+                topk_global[: global_req_id.shape[0]],
                 dcp_size=self.dcp_world_size,
                 dcp_rank=self.dcp_rank,
                 cp_kv_cache_interleave_size=(
                     attn_metadata.cp_kv_cache_interleave_size
                 ),
                 BLOCK_SIZE=attn_metadata.block_size,
-                NUM_TOPK_TOKENS=topk_all.shape[1],
+                NUM_TOPK_TOKENS=topk_global.shape[1],
                 return_valid_counts=True,
                 compact_valid_to_front=True,
+                row_indices=gathered_rows,
+                row_valid_mask=valid_rows,
             )
             partial, lse = self._run_sparse_mqa_kernel(
                 q_all,
@@ -619,7 +613,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 partial,
                 lses,
                 cp_group.rank_in_group,
-                CPTritonContext(),
+                cp_ctx,
                 is_lse_base_on_e=self.lse_base_on_e,
             )
             out_chunks.append(cp_group.reduce_scatter(partial, dim=0))

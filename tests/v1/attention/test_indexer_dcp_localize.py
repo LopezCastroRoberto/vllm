@@ -672,6 +672,51 @@ def test_dcp_filter_compacts_valid_slots_for_sparse_kernel():
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+def test_dcp_filter_applies_pcp_row_map_without_materializing_topk_copy():
+    block_size = 4
+    num_topk = 128
+    dcp_size = 2
+    req_id = torch.tensor([0, 1, 0], dtype=torch.int32, device="cuda")
+    token_indices = torch.full(
+        (3, num_topk), -1, dtype=torch.int32, device="cuda"
+    )
+    token_indices[0, :4] = torch.tensor([0, 1, 2, 3], device="cuda")
+    token_indices[1, :4] = torch.tensor([4, 5, 6, 7], device="cuda")
+    token_indices[2, :4] = torch.tensor([8, 9, 10, 11], device="cuda")
+    block_table = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32, device="cuda")
+    row_indices = torch.tensor([2, 0, 1, 0], dtype=torch.int64, device="cuda")
+    row_valid_mask = torch.tensor([True, True, True, False], device="cuda")
+
+    out, valid_counts = triton_filter_and_convert_dcp_index(
+        req_id,
+        block_table,
+        token_indices,
+        dcp_size=dcp_size,
+        dcp_rank=0,
+        BLOCK_SIZE=block_size,
+        NUM_TOPK_TOKENS=num_topk,
+        return_valid_counts=True,
+        row_indices=row_indices,
+        row_valid_mask=row_valid_mask,
+    )
+    expected, expected_counts = triton_filter_and_convert_dcp_index(
+        req_id[row_indices[:3]],
+        block_table,
+        token_indices[row_indices[:3]],
+        dcp_size=dcp_size,
+        dcp_rank=0,
+        BLOCK_SIZE=block_size,
+        NUM_TOPK_TOKENS=num_topk,
+        return_valid_counts=True,
+    )
+
+    torch.testing.assert_close(out[:3], expected)
+    torch.testing.assert_close(valid_counts[:3], expected_counts)
+    assert (out[3] == -1).all()
+    assert valid_counts[3].item() == 0
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
 @pytest.mark.parametrize("interleave", [1, 2])
 @pytest.mark.parametrize("dcp_rank", [0, 1])
 # 384 is not a power of two, so it exercises the multi-tile atomic allocator

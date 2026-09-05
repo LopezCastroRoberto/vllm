@@ -460,8 +460,7 @@ def sparse_attn_indexer(
                 dense_mha_selected and mla_num_decode_tokens == num_decode_tokens
             )
 
-    local_topk_indices_buffer = topk_indices_buffer
-    local_topk_buffer_rows = hidden_states.shape[0]
+    topk_buffer_rows = hidden_states.shape[0]
     if pcp_token_sharded:
         pcp_group = get_pcp_group()
         num_padded = attn_metadata_narrowed.pcp_num_padded
@@ -491,20 +490,19 @@ def sparse_attn_indexer(
             q_scale = pcp_group.all_gather(
                 q_scale[:num_padded].contiguous(), dim=0
             )[restore_idx]
-        topk_indices_buffer = torch.full(
-            (restore_idx.shape[0], local_topk_indices_buffer.shape[1]),
-            -1,
-            dtype=local_topk_indices_buffer.dtype,
-            device=local_topk_indices_buffer.device,
-        )
+        # The shared buffer is sized for the global scheduler token budget.
+        # Reuse it for global scoring instead of allocating another
+        # max_tokens x topk tensor once per sparse layer.
+        topk_buffer_rows = restore_idx.shape[0]
+        assert topk_buffer_rows <= topk_indices_buffer.shape[0]
 
     # The buffer must be pre-filled with -1 (the "no token" sentinel) before the
     # top-k kernels scatter valid indices into it. On the fused deepseek_v32
     # nvidia path, _fused_norm_rope_kernel already cleared the same
     # [:num_tokens, :topk] region earlier in this forward, so skip the redundant
     # fill.
-    if not skip_topk_buffer_clear:
-        topk_indices_buffer[: hidden_states.shape[0]] = -1
+    if pcp_token_sharded or not skip_topk_buffer_clear:
+        topk_indices_buffer[:topk_buffer_rows] = -1
     if has_prefill and not dense_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
@@ -603,15 +601,10 @@ def sparse_attn_indexer(
             )
 
     if pcp_token_sharded:
-        local_rows = attn_metadata_narrowed.pcp_local_rows
-        assert local_rows is not None
-        selected = topk_indices_buffer[local_rows, :topk_tokens].clone()
-        local_topk_indices_buffer[: local_rows.shape[0], :topk_tokens].copy_(selected)
-        if local_rows.shape[0] < local_topk_buffer_rows:
-            local_topk_indices_buffer[local_rows.shape[0] : local_topk_buffer_rows].fill_(
-                -1
-            )
-        return local_topk_indices_buffer
+        # _merge_dcp_topk_global replicated the exact global rows on every
+        # rank. Keep that representation for sparse attention; compacting to
+        # local PCP rows would only force attention to AllGather it again.
+        return topk_indices_buffer
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode

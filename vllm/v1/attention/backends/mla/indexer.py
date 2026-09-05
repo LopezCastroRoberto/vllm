@@ -462,7 +462,6 @@ class DeepseekV32IndexerMetadata:
     # shard must score identical query rows before candidate Top-K reduction.
     pcp_num_padded: int | None = None
     pcp_restore_idx: torch.Tensor | None = None
-    pcp_local_rows: torch.Tensor | None = None
     pcp_gathered_slot_mapping: torch.Tensor | None = None
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
