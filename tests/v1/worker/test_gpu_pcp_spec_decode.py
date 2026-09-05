@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.v1.attention.ops import pcp as pcp_ops
 from vllm.v1.worker.gpu import pcp_manager as pcp_manager_module
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
@@ -77,7 +78,7 @@ def test_replicated_verification_skips_pcp_restore(monkeypatch):
     )
     local_batch = manager.partition_batch(global_batch, padded_num_tokens=8)
 
-    assert manager._replicated_verification
+    assert manager._replicated_batch
     assert local_batch.num_draft_tokens == 3
     assert local_batch.num_tokens_after_padding == 8
     torch.testing.assert_close(
@@ -128,6 +129,60 @@ def test_replicated_verification_skips_pcp_restore(monkeypatch):
     # return the otherwise-correct global scratch buffer at a new address.
     assert runtime_slot_mappings.data_ptr() == captured_ptr
     torch.testing.assert_close(runtime_slot_mappings, expected_slots)
+
+
+def test_dcp_keeps_target_batch_replicated(monkeypatch):
+    device = torch.device("cpu")
+    global_buffers = InputBuffers(max_num_reqs=1, max_num_tokens=8, device=device)
+    global_batch = InputBatch.make_dummy(
+        num_reqs=1,
+        num_tokens=4,
+        input_buffers=global_buffers,
+    )
+    global_batch.seq_lens.fill_(12)
+
+    def prepare_dcp_local_seq_lens(out, seq_lens, *_args):
+        out.copy_(seq_lens // 4)
+
+    monkeypatch.setattr(
+        pcp_manager_module,
+        "prepare_dcp_local_seq_lens",
+        prepare_dcp_local_seq_lens,
+    )
+
+    manager = PCPManager(
+        pcp_world_size=4,
+        pcp_rank=0,
+        dcp_world_size=4,
+        dcp_rank=0,
+        device=device,
+        req_states=SimpleNamespace(),
+        max_num_reqs=1,
+        max_num_tokens=8,
+    )
+    local_batch = manager.partition_batch(global_batch)
+
+    assert manager._replicated_batch
+    assert local_batch.num_tokens == global_batch.num_tokens
+    assert local_batch.query_start_loc.tolist() == [0, 4]
+    assert local_batch.dcp_local_seq_lens.tolist() == [3]
+
+
+def test_mixed_replicated_cache_inputs_skip_pcp_gather(monkeypatch):
+    tensors = (torch.arange(8).reshape(4, 2),)
+    slot_mapping = torch.arange(4)
+
+    monkeypatch.setattr(
+        pcp_ops,
+        "get_pcp_group",
+        lambda: pytest.fail("replicated inputs must not use PCP all-gather"),
+    )
+    actual_tensors, actual_slots = pcp_ops._gather_prefill_cache_inputs(
+        tensors, slot_mapping, num_decode_tokens=2
+    )
+
+    assert actual_tensors is tensors
+    assert actual_slots is slot_mapping
 
 
 def test_restore_hidden_states_appends_zero_graph_padding(monkeypatch):

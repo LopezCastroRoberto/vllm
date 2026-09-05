@@ -1270,11 +1270,12 @@ class MLADCPManager:
     ) -> DCPCombine:
         direct_workspace = None
         if self.use_a2a:
+            output_heads = num_heads // self.group.world_size if use_pcp else num_heads
             direct_workspace = get_direct_dcp_a2a_workspace(
                 self.group,
                 self.device,
                 self.max_num_tokens,
-                num_heads,
+                output_heads,
                 head_dim,
                 dtype,
                 self.num_ubatches,

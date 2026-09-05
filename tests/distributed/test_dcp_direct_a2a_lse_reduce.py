@@ -391,6 +391,31 @@ def test_mla_dcp_manager_selects_direct_backends(monkeypatch):
     )
 
 
+def test_mla_dcp_manager_sizes_direct_pcp_output_heads(monkeypatch):
+    import vllm.v1.attention.ops.dcp as dcp_manager
+
+    monkeypatch.setattr(dcp_manager, "get_dcp_group", lambda: MagicMock(world_size=4))
+    direct_workspace = MagicMock()
+    get_workspace = MagicMock(return_value=direct_workspace)
+    monkeypatch.setattr(dcp_manager, "get_direct_dcp_a2a_workspace", get_workspace)
+
+    manager = dcp_manager.MLADCPManager(
+        vllm_config=_manager_config(),
+        device=torch.device("cpu"),
+        num_heads=64,
+        query_head_dim=8,
+        output_head_dim=4,
+        query_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        padded_num_heads=None,
+        is_lse_base_on_e=False,
+        use_pcp=True,
+    )
+
+    assert manager.query_gather is None
+    assert get_workspace.call_args.args[3] == 16
+
+
 def test_mla_dcp_manager_selects_fallback_backends(monkeypatch):
     import vllm.v1.attention.ops.dcp as dcp_manager
 
