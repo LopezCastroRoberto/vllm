@@ -141,6 +141,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
     maybe_create_adaptive_verification_manager,
 )
+from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
 )
@@ -1841,18 +1842,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
-        # Pure prefill retains PCP-local target auxiliary states and slot mappings.
-        # Project only this rank's shard, then publish those physical draft-cache
-        # rows to every PCP peer. Mixed/decode batches use the restored full-context
-        # fallback because rejected speculative suffixes must be filtered first.
+        # Pure prefill still has PCP-local target auxiliary states and slot
+        # mappings here. Project only this rank's DSpark context shard, then
+        # publish those physical draft-cache rows to every PCP replica.
         if (
             self.pcp_manager is not None
-            and self.speculator is not None
+            and self.pcp_manager.direct_kv_enabled
+            and isinstance(self.speculator, DSparkSpeculator)
+            and self.speculative_config is not None
+            and self.speculative_config.method == "dspark"
             and aux_hidden_states is not None
             and slot_mappings_by_layer is not None
             and input_batch.has_prefill
             and input_batch.is_prefilling_np.all()
-            and hasattr(self.speculator, "precompute_pcp_context_kv")
         ):
             with use_workspace_lane(self._draft_workspace_lane):
                 self.speculator.precompute_pcp_context_kv(
