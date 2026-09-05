@@ -45,6 +45,23 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 MXFP4_BLOCK_SIZE = 32
 
 
+def _narrow_indexer_k_to_slot_layout(
+    k: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    use_pcp: bool,
+    pcp_world_size: int,
+) -> torch.Tensor:
+    num_tokens = slot_mapping.shape[0]
+    if use_pcp and num_tokens > k.shape[0]:
+        if num_tokens % pcp_world_size != 0:
+            raise ValueError(
+                f"PCP slot mapping width {num_tokens} is not divisible by "
+                f"PCP size {pcp_world_size}."
+            )
+        num_tokens //= pcp_world_size
+    return k[: min(num_tokens, k.shape[0])]
+
+
 def _assert_cutedsl_dcp_merge_supported(
     logits: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -380,11 +397,13 @@ def sparse_attn_indexer(
     # size while slot_mapping only covers actual tokens. Truncate k to avoid
     # out-of-bounds reads in the kernel.
     # Keep PCP padding so every rank contributes the same all-gather shape.
-    num_tokens = slot_mapping.shape[0]
-    if use_pcp:
-        num_tokens //= get_pcp_group().world_size
     if k is not None:
-        k = k[:num_tokens]
+        k = _narrow_indexer_k_to_slot_layout(
+            k,
+            slot_mapping,
+            use_pcp,
+            get_pcp_group().world_size if use_pcp else 1,
+        )
 
     if not skip_k_cache_insert:
         assert k is not None

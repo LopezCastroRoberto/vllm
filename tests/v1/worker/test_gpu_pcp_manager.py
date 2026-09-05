@@ -137,3 +137,27 @@ def test_sparse_mla_pcp_accepts_piecewise_cudagraphs():
         PCPManager.validate_config(
             make_config(CUDAGraphMode.FULL), supports_mm_inputs=False
         )
+
+
+def test_sparse_mla_pcp_accepts_mtp():
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=4,
+            decode_context_parallel_size=1,
+            pipeline_parallel_size=1,
+        ),
+        model_config=SimpleNamespace(
+            use_mla=True,
+            is_encoder_decoder=False,
+            hf_text_config=SimpleNamespace(index_topk=2048),
+        ),
+        lora_config=None,
+        speculative_config=SimpleNamespace(
+            method="mtp",
+            use_dspark=lambda: False,
+            enable_adaptive_verification=False,
+        ),
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE),
+    )
+
+    PCPManager.validate_config(config, supports_mm_inputs=False)
