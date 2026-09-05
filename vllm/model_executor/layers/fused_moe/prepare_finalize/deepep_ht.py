@@ -25,7 +25,6 @@ from vllm.v1.worker.ubatching import (
     dbo_yield_and_switch_from_compute_to_comm,
 )
 
-
 class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     """
     Prepare/Finalize using DeepEP High-Throughput kernels.
