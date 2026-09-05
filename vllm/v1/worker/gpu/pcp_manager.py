@@ -656,9 +656,11 @@ class PCPManager:
             cu_num_logits = torch.zeros(
                 num_local_reqs + 1, device=self.device, dtype=torch.int32
             )
-        if self._use_mtp:
-            # The global batch already materialized sampled and draft tokens.
-            # Recombining would overwrite the final draft with the sampled token.
+        if self._use_mtp or global_batch.num_draft_tokens > 0:
+            # The global batch already materialized sampled and draft tokens before
+            # PCP partitioning. Recombining a mixed speculative batch after its local
+            # metadata has been collapsed to one logit per request would overwrite
+            # the final draft with the sampled token.
             logits_indices = local_query_start_loc[1:] - 1
         else:
             logits_indices = combine_sampled_and_draft_tokens(
