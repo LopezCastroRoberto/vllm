@@ -204,7 +204,6 @@ class PCPManager:
         if vllm_config.lora_config is not None:
             raise NotImplementedError("MRV2 PCP does not support LoRA yet.")
         speculative_config = vllm_config.speculative_config
-        is_sparse_mla = hasattr(model_config.hf_text_config, "index_topk")
         if speculative_config is not None:
             if speculative_config.use_dspark():
                 # DSpark with PCP always needs the direct/peer KV path: prefill
@@ -220,12 +219,6 @@ class PCPManager:
                         "every PCP peer's draft cache."
                     )
             elif speculative_config.method == "mtp":
-                if is_sparse_mla:
-                    raise NotImplementedError(
-                        "MRV2 PCP MTP currently supports dense MLA only."
-                    )
-                if parallel_config.decode_context_parallel_size != 1:
-                    raise NotImplementedError("MRV2 PCP MTP does not support DCP yet.")
                 if speculative_config.enable_adaptive_verification:
                     raise NotImplementedError(
                         "MRV2 PCP MTP does not support adaptive verification yet."
