@@ -17,6 +17,7 @@ from vllm.model_executor.layers.attention.pcp_direct_kv import (
     get_layer_peer_ptrs,
     pcp_direct_kv_active,
     publish_pcp_direct_kv,
+    publish_pcp_sharded_peer_kv,
 )
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -585,6 +586,28 @@ class DeepseekV32Attention(MLAAttention):
                 self.kv_cache_dtype,
                 self._k_scale,
             )
+            # Rank-symmetric peer-cache fence # __DCP4_SPARSE_FENCE_FIX__: publish this
+            # rank's sharded DCP KV writes before any peer reads them in
+            # forward_mqa. The dense path fences here unconditionally; the
+            # sparse decode/prefill path must too, otherwise peers race
+            # ahead into the peer-KV gather while this rank is still in
+            # do_kv_cache_update -> device-side deadlock under DCP>1.
+            #
+            # Skip while a breakable-cudagraph capture is ACTIVE: capture
+            # runs this eager-break region via add_eager (segment capture
+            # already ended) but the ranks capture their graph shapes
+            # independently, so the cross-rank fence would spin at mismatched
+            # epochs and PTX-trap (async unspecified launch failure surfacing
+            # at the post-capture reset sync). current() is None during
+            # replay() and real eager inference, so the fence still fires
+            # there -- the eager lambda re-runs this whole region at replay,
+            # in cross-rank lockstep. Mirrors the direct-KV path, whose fence
+            # is recorded-not-executed inside the captured graph.
+            from vllm.compilation.breakable_cudagraph import (
+                BreakableCUDAGraphCapture,
+            )
+            if BreakableCUDAGraphCapture.current() is None:
+                publish_pcp_sharded_peer_kv()
 
         num_actual = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
         if num_actual == 0:
