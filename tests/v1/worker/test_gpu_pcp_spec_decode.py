@@ -78,7 +78,7 @@ def test_replicated_verification_skips_pcp_restore(monkeypatch):
     )
     local_batch = manager.partition_batch(global_batch, padded_num_tokens=8)
 
-    assert manager._replicated_batch
+    assert manager._replicated_verification
     assert local_batch.num_draft_tokens == 3
     assert local_batch.num_tokens_after_padding == 8
     torch.testing.assert_close(
@@ -131,41 +131,58 @@ def test_replicated_verification_skips_pcp_restore(monkeypatch):
     torch.testing.assert_close(runtime_slot_mappings, expected_slots)
 
 
-def test_dcp_keeps_target_batch_replicated(monkeypatch):
-    device = torch.device("cpu")
-    global_buffers = InputBuffers(max_num_reqs=1, max_num_tokens=8, device=device)
-    global_batch = InputBatch.make_dummy(
-        num_reqs=1,
-        num_tokens=4,
-        input_buffers=global_buffers,
-    )
-    global_batch.seq_lens.fill_(12)
+def _copy_to_cpu(value, out=None, device=None):
+    tensor = torch.from_numpy(value) if isinstance(value, np.ndarray) else value
+    if out is not None:
+        return out.copy_(tensor)
+    return tensor
 
-    def prepare_dcp_local_seq_lens(out, seq_lens, *_args):
-        out.copy_(seq_lens // 4)
 
-    monkeypatch.setattr(
-        pcp_manager_module,
-        "prepare_dcp_local_seq_lens",
-        prepare_dcp_local_seq_lens,
-    )
+def test_dcp_shards_prefill_across_pcp_ranks(monkeypatch):
+    # PCP-spanning DCP (tp1, dcp == pcp) no longer replicates the whole prefill
+    # batch to every PCP rank (the pre-8c008aabe behaviour).  Each rank owns a
+    # 1/pcp shard of the prefill query and reads peers' KV directly, so the
+    # per-rank token layout must be the sharded decomposition, not the global one.
+    monkeypatch.setattr(pcp_manager_module, "async_copy_to_gpu", _copy_to_cpu)
 
     manager = PCPManager(
         pcp_world_size=4,
         pcp_rank=0,
         dcp_world_size=4,
         dcp_rank=0,
-        device=device,
-        req_states=SimpleNamespace(),
-        max_num_reqs=1,
-        max_num_tokens=8,
+        device=torch.device("cpu"),
     )
-    local_batch = manager.partition_batch(global_batch)
 
-    assert manager._replicated_batch
-    assert local_batch.num_tokens == global_batch.num_tokens
-    assert local_batch.query_start_loc.tolist() == [0, 4]
-    assert local_batch.dcp_local_seq_lens.tolist() == [3]
+    segments_by_rank, per_rank_num_tokens = manager._build_batch_layout(
+        num_scheduled_tokens=np.array([4], dtype=np.int32),
+        num_computed_tokens=np.zeros(1, dtype=np.int32),
+        is_prefilling=np.ones(1, dtype=np.bool_),
+        query_start_loc_np=np.array([0, 4], dtype=np.int32),
+        padded_num_tokens=4,
+    )
+
+    # 4 prefill tokens sharded across 4 PCP ranks -> exactly one token each,
+    # instead of every rank receiving the full 4-token batch.
+    assert per_rank_num_tokens == [1, 1, 1, 1]
+
+    request_indices = [
+        [segment.global_batch_req_idx for segment in rank]
+        for rank in segments_by_rank
+    ]
+    assert request_indices == [[0], [0], [0], [0]]
+
+    # Rank r owns contiguous global query slice [r, r + 1): a 1/pcp shard.
+    global_slices = [
+        [
+            (segment.global_batch_slice.start, segment.global_batch_slice.stop)
+            for segment in rank
+        ]
+        for rank in segments_by_rank
+    ]
+    assert global_slices == [[(0, 1)], [(1, 2)], [(2, 3)], [(3, 4)]]
+
+    # Hidden-state restore gathers each rank's shard back into global order.
+    assert manager._hidden_restore_idx.tolist() == [0, 4, 8, 12]
 
 
 def test_mixed_replicated_cache_inputs_skip_pcp_gather(monkeypatch):

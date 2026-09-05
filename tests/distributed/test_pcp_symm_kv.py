@@ -643,7 +643,7 @@ def _worker_copy_cache_rows_to_peers(env: dict[str, str]) -> None:
         slots,
         allocation.peer_ptrs_for_view(cache),
         rank,
-        block_size,
+        token_dim=1,
     )
     fence = PCPPeerCacheFence(dist.group.WORLD, device)
     fence()

@@ -36,6 +36,7 @@ from vllm.v1.attention.backends.utils import (
     get_num_attention_heads_from_layers,
 )
 from vllm.v1.attention.ops.dcp import (
+    cp_lse_ag_out_ar,
     cp_lse_ag_out_rs,
     dcp_a2a_lse_reduce,
 )
@@ -460,6 +461,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
         if self.dcp_world_size > 1:
             max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+            # PCP DualChunkSwap splits each prefill request into two rank-local
+            # segments, so a PCP-partitioned batch drives build() with up to
+            # 2 * max_num_seqs requests (see pcp_manager.py: max_num_local_reqs
+            # = 2 * max_num_reqs). Size this persistent buffer for that upper
+            # bound; otherwise `self._dcp_context_kv_lens[:num_reqs] = ...`
+            # overflows during the shared prepare_attn pass under PCP-spanning DCP.
+            if vllm_config.parallel_config.prefill_context_parallel_size > 1:
+                max_num_reqs *= 2
             self._dcp_context_kv_lens = torch.zeros(
                 max_num_reqs,
                 dtype=torch.int32,
@@ -868,6 +877,18 @@ class FlashAttentionImpl(AttentionImpl):
             and vllm_config.parallel_config.dcp_comm_backend == "a2a"
         )
         self.dcp_combine = dcp_a2a_lse_reduce if dcp_a2a else cp_lse_ag_out_rs
+        self.dcp_has_replicated_heads = bool(
+            vllm_config is not None
+            and self.dcp_world_size > 1
+            and vllm_config.parallel_config.tensor_parallel_size == 1
+            and vllm_config.parallel_config.prefill_context_parallel_size > 1
+            and vllm_config.parallel_config.decode_context_parallel_size
+            == vllm_config.parallel_config.prefill_context_parallel_size
+        )
+        if self.dcp_has_replicated_heads:
+            # PCP-spanning DCP ranks hold replicas of every query head rather
+            # than distinct TP head shards. Preserve the full local head set.
+            self.dcp_combine = cp_lse_ag_out_ar
 
         self._dcp_dtype: torch.dtype | None = None
         self._dcp_max_num_tokens: int = 0
@@ -1224,7 +1245,11 @@ class FlashAttentionImpl(AttentionImpl):
             )
             return output
 
-        query_across_dcp = get_dcp_group().all_gather(query, dim=1)
+        query_across_dcp = (
+            query
+            if self.dcp_has_replicated_heads
+            else get_dcp_group().all_gather(query, dim=1)
+        )
         sliding_window_size = (
             list(self.sliding_window) if self.sliding_window is not None else None
         )
@@ -1245,7 +1270,7 @@ class FlashAttentionImpl(AttentionImpl):
         dcp_context_out_spec = (
             (
                 dcp_context_out_tokens,
-                self.num_heads * self.dcp_world_size,
+                query_across_dcp.shape[1],
                 self.head_size,
             ),
             self._dcp_dtype,
@@ -1318,6 +1343,8 @@ class FlashAttentionImpl(AttentionImpl):
             context_lse.transpose(0, 1),
             get_dcp_group(),
             return_lse=True,
+            seq_lens=attn_metadata.dcp_context_kv_lens,
+            query_start_loc=cu_seqlens_q,
         )
         context_lse_cor = context_lse_cor.transpose(0, 1).contiguous()
 
