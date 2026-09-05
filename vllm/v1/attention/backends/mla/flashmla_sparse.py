@@ -315,9 +315,19 @@ class FlashMLASparseMetadataBuilder(
             device=device,
         )
 
-        self.fp8_use_mixed_batch = self.num_heads < MIN_HEADS_FOR_BF16_PREFILL
+        dcp_world_size = parallel_config.decode_context_parallel_size
+        pcp_world_size = parallel_config.prefill_context_parallel_size
+        # When PCP spans the DCP group, each rank keeps its local query heads and
+        # DCP combines partial attention outputs across the PCP ranks.  Use the
+        # mixed path in this topology so FlashMLA returns an LSE for every token.
+        # Unlike ordinary DCP, PCP-spanning DCP does not gather query heads, so
+        # the local fp8 decode head envelope remains the kernel envelope.
+        pcp_spans_dcp = pcp_world_size > 1 and pcp_world_size == dcp_world_size
+        self.fp8_use_mixed_batch = (
+            self.num_heads < MIN_HEADS_FOR_BF16_PREFILL or pcp_spans_dcp
+        )
 
-        if parallel_config.decode_context_parallel_size > 1:
+        if dcp_world_size > 1:
             if parallel_config.dcp_comm_backend != "ag_rs":
                 raise NotImplementedError(
                     "DCP for FlashMLA sparse is only validated with the "
@@ -336,7 +346,7 @@ class FlashMLASparseMetadataBuilder(
             # computed from the local head count, but the kernel runs on the
             # DCP-gathered heads.
             gathered_num_heads = (
-                self.num_heads * parallel_config.decode_context_parallel_size
+                self.num_heads if pcp_spans_dcp else self.num_heads * dcp_world_size
             )
             gathered_padded_heads = FlashMLASparseImpl._compute_fp8_decode_padded_heads(
                 gathered_num_heads
@@ -552,6 +562,9 @@ class FlashMLASparseMetadataBuilder(
 
 class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
     can_return_lse_for_decode: bool = True
+    # The mixed fp8 path processes all scheduled query tokens together, and its
+    # slot mapping and sparse-index conversion both honor the CP interleave.
+    supports_mtp_with_cp_non_trivial_interleave_size: bool = True
 
     @staticmethod
     def _compute_fp8_decode_padded_heads(num_heads: int) -> int:

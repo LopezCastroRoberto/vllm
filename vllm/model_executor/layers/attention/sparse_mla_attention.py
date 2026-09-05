@@ -128,6 +128,11 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             parallel_config.prefill_context_parallel_size > 1
             and not vllm_config.attention_config.disable_pcp
         )
+        self.pcp_spans_dcp = (
+            self.use_pcp
+            and parallel_config.decode_context_parallel_size
+            == parallel_config.prefill_context_parallel_size
+        )
         try:
             self.dcp_world_size = get_dcp_group().world_size
         except AssertionError:
@@ -297,7 +302,10 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
                 output_dtype=self.model_config.dtype,
                 prefill_backend=self._prefill_backend,
                 use_dense_mha=(
-                    prefill_max_seq_len <= self.topk_tokens
+                    (
+                        prefill_max_seq_len <= self.topk_tokens
+                        or (self.pcp_spans_dcp and num_decode_tokens == 0)
+                    )
                     and not self.vllm_config.attention_config.sparse_mla_force_mqa
                 ),
                 topk_mask_workspace=self.topk_mask_workspace,
