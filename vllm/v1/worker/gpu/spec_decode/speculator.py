@@ -79,7 +79,7 @@ class DraftModelSpeculator(BaseSpeculator):
         self.replicated_pcp = (
             target_parallel_config.prefill_context_parallel_size > 1
             and speculative_config is not None
-            and speculative_config.method == "mtp"
+            and (speculative_config.method == "mtp" or speculative_config.use_dspark())
         )
         if self.replicated_pcp:
             vllm_config = replace(

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -70,6 +71,19 @@ def test_qwen3_dflash_forwards_pcp_publication() -> None:
         publish_to_pcp=True,
     )
     assert model.model.publish_to_pcp is True
+
+
+def test_replicated_pcp_regathers_global_block_tables() -> None:
+    speculator = object.__new__(DFlashSpeculator)
+    speculator.replicated_pcp = True
+    speculator.block_tables = Mock()
+    input_batch = SimpleNamespace(idx_mapping=torch.tensor([3, 1]))
+
+    speculator._gather_replicated_pcp_block_tables(input_batch, num_reqs=2)
+
+    speculator.block_tables.gather_block_tables.assert_called_once_with(
+        input_batch.idx_mapping, num_reqs_padded=2
+    )
 
 
 def test_precompute_pcp_context_kv_uses_local_rows_and_marks_step() -> None:

@@ -159,6 +159,15 @@ class DFlashSpeculator(DraftModelSpeculator):
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
 
+    def _gather_replicated_pcp_block_tables(
+        self, input_batch: InputBatch, num_reqs: int
+    ) -> None:
+        if self.replicated_pcp:
+            # The target leaves these populated for its PCP-local batch.
+            self.block_tables.gather_block_tables(
+                input_batch.idx_mapping, num_reqs_padded=num_reqs
+            )
+
     def load_draft_model(
         self,
         target_model: nn.Module,
@@ -426,6 +435,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             )
             return self.draft_tokens[:num_reqs]
+
+        self._gather_replicated_pcp_block_tables(input_batch, num_reqs)
 
         # The query slot mapping is written into the shared BlockTables slot_mappings.
         # That buffer's address is what the captured CUDA graph reads from at replay.
