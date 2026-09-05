@@ -83,6 +83,29 @@ def _peer_cache_fence_kernel(
     _trap_if_nonzero(pending)
 
 
+@triton.jit
+def _copy_cache_rows_to_peers_kernel(
+    peer_ptrs,
+    slot_mapping,
+    row_nbytes,
+    source_rank: tl.constexpr,
+    world_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    byte_offset = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    slot = tl.load(slot_mapping + token_idx)
+    mask = (slot >= 0) & (byte_offset < row_nbytes)
+    source_base = tl.load(peer_ptrs + source_rank).to(tl.pointer_type(tl.uint8))
+    source = source_base + slot * row_nbytes + byte_offset
+    value = tl.load(source, mask=mask, other=0)
+    for peer in tl.static_range(0, world_size):
+        if peer != source_rank:
+            destination_base = tl.load(peer_ptrs + peer).to(tl.pointer_type(tl.uint8))
+            destination = destination_base + slot * row_nbytes + byte_offset
+            tl.store(destination, value, mask=mask)
+
+
 class PCPPeerCacheFence:
     """Device-epoch release/acquire publication for one PCP group."""
 
@@ -114,7 +137,9 @@ class PCPPeerCacheFence:
 
     def close(self) -> None:
         torch.accelerator.synchronize(self._allocation.storage.device)
-        dist.barrier(group=self._group)
+        # Cleanup must remain non-collective: a peer may already have failed
+        # while another worker is unwinding. A process-group barrier here can
+        # deadlock the entire executor on any asynchronous worker failure.
         self._allocation.close()
 
 
@@ -157,6 +182,71 @@ def get_layer_peer_ptrs(layer_name: str) -> torch.Tensor | None:
     if not _STATE.enabled:
         return None
     return _STATE.layer_peer_ptrs.get(layer_name)
+
+
+def copy_pcp_cache_rows_to_peers(
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    peer_ptrs: torch.Tensor,
+    source_rank: int,
+    block_size: int,
+) -> None:
+    """Copy locally produced physical cache rows to every PCP peer.
+
+    The cache must be a contiguous paged tensor whose first two logical
+    dimensions are ``[num_blocks, block_size]``. The copy is byte-oriented,
+    so it preserves BF16, FP8 and packed cache row layouts unchanged.
+    """
+    if not cache.is_cuda or not slot_mapping.is_cuda or not peer_ptrs.is_cuda:
+        raise ValueError("PCP cache-row publication requires CUDA tensors")
+    if not cache.is_contiguous():
+        raise ValueError("PCP cache-row publication requires a contiguous cache")
+    if cache.ndim < 2 or cache.shape[1] != block_size:
+        raise ValueError(
+            "Expected paged cache shape [num_blocks, block_size, ...], got "
+            f"{tuple(cache.shape)} with block_size={block_size}"
+        )
+    if slot_mapping.ndim != 1:
+        raise ValueError("PCP cache-row slot mapping must be one-dimensional")
+    world_size = peer_ptrs.numel()
+    if world_size <= 1 or slot_mapping.numel() == 0:
+        return
+    if not 0 <= source_rank < world_size:
+        raise ValueError(
+            f"PCP source rank {source_rank} is outside world size {world_size}"
+        )
+    num_physical_rows = cache.shape[0] * block_size
+    cache_nbytes = cache.numel() * cache.element_size()
+    if cache_nbytes % num_physical_rows != 0:
+        raise ValueError("Cache byte size is not divisible by its physical rows")
+    row_nbytes = cache_nbytes // num_physical_rows
+    block = 256
+    _copy_cache_rows_to_peers_kernel[
+        (slot_mapping.numel(), triton.cdiv(row_nbytes, block))
+    ](
+        peer_ptrs,
+        slot_mapping,
+        row_nbytes,
+        source_rank=source_rank,
+        world_size=world_size,
+        BLOCK_SIZE=block,
+    )
+
+
+def publish_pcp_cache_rows(
+    layer_name: str,
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int,
+) -> None:
+    if not _STATE.enabled:
+        raise RuntimeError("PCP direct-KV is not active")
+    peer_ptrs = _STATE.layer_peer_ptrs.get(layer_name)
+    if peer_ptrs is None:
+        raise RuntimeError(f"No PCP peer cache pointers registered for {layer_name}")
+    copy_pcp_cache_rows_to_peers(
+        cache, slot_mapping, peer_ptrs, _STATE.rank, block_size
+    )
 
 
 def publish_pcp_direct_kv() -> None:
