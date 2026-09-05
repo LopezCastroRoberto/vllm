@@ -950,6 +950,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             self._dummy_run(**batch)
                     self.adaptive_verification.set_initial_cost_curves(timings)
 
+        from vllm.model_executor.layers.attention.pcp_direct_kv import (
+            reset_pcp_peer_cache_fence,
+        )
+
+        reset_pcp_peer_cache_fence()
+
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
         elapsed_time = end_time - start_time
@@ -1849,9 +1855,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
-        # Pure prefill still has PCP-local target auxiliary states and slot
-        # mappings here. Project only this rank's DSpark context shard, then
-        # publish those physical draft-cache rows to every PCP replica.
+        # Pure prefill retains PCP-local target auxiliary states and slot mappings.
+        # Project only this rank's shard. Replicated PCP copies those physical
+        # draft-cache rows to every peer; PCP-spanning DCP leaves them sharded.
+        # Mixed/decode batches use the restored full-context fallback because
+        # rejected speculative suffixes must be filtered first.
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        is_pcp_kv_producer = bool(
+            self.pcp_manager is not None
+            and kv_transfer_config is not None
+            and kv_transfer_config.is_kv_producer
+        )
         if (
             self.pcp_manager is not None
             and self.pcp_manager.direct_kv_enabled
@@ -1868,6 +1882,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch,
                     aux_hidden_states,
                     slot_mappings_by_layer,
+                    retain_for_proposal=not is_pcp_kv_producer,
                 )
             aux_hidden_states = None
 
@@ -1926,8 +1941,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             routed_experts=routed_experts,
         )
 
+        skip_pcp_producer_draft = is_pcp_kv_producer
+
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
-        if self.speculator is not None and self.speculator.supports_mm_inputs:
+        if (
+            self.speculator is not None
+            and not skip_pcp_producer_draft
+            and self.speculator.supports_mm_inputs
+        ):
             # Get cached multimodal embeddings for draft forward.
             # NOTE: This is done here because postprocess updates
             # num_computed_prefill_tokens.
@@ -1951,7 +1972,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
-        if self.speculator is not None:
+        if self.speculator is not None and not skip_pcp_producer_draft:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
@@ -1990,7 +2011,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
 
-        if self.num_speculative_steps > 0:
+        if self.num_speculative_steps > 0 and not skip_pcp_producer_draft:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
             self.draft_tokens_handler.set_draft_tokens(

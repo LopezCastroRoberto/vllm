@@ -826,9 +826,11 @@ class Worker(WorkerBase):
 
             maybe_save_startup_plan(self, kv_cache_memory_bytes_to_requested_limit)
 
+        kv_transfer_config = self.vllm_config.kv_transfer_config
         skip_v2_warmup = (
             self.parallel_config.prefill_context_parallel_size > 1
-            and self.vllm_config.kv_transfer_config.is_kv_producer
+            and kv_transfer_config is not None
+            and kv_transfer_config.is_kv_producer
         )
         if self.use_v2_model_runner and not skip_v2_warmup:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.

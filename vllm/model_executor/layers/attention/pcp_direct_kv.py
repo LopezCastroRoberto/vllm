@@ -39,8 +39,9 @@ def _gather_sharded_peer_cache_kernel(
     scale,
     block_table_stride: tl.constexpr,
     cache_block_size: tl.constexpr,
+    cache_block_stride_bytes: tl.constexpr,
+    cache_token_stride_bytes: tl.constexpr,
     row_dim: tl.constexpr,
-    cache_entry_bytes: tl.constexpr,
     world_size: tl.constexpr,
     interleave_size: tl.constexpr,
     packed_ds_mla: tl.constexpr,
@@ -59,11 +60,15 @@ def _gather_sharded_peer_cache_kernel(
     )
     block_idx = local_pos // cache_block_size
     block_number = tl.load(block_table + req_idx * block_table_stride + block_idx)
-    slot = block_number * cache_block_size + local_pos % cache_block_size
+    block_offset = local_pos % cache_block_size
 
     peer_base = tl.load(peer_ptrs + owner).to(tl.pointer_type(tl.uint8))
     mask = cols < row_dim
-    entry_base = peer_base + slot * cache_entry_bytes
+    entry_base = (
+        peer_base
+        + block_number * cache_block_stride_bytes
+        + block_offset * cache_token_stride_bytes
+    )
     if packed_ds_mla:
         nope_mask = mask & (cols < 512)
         raw = tl.load(entry_base + cols, mask=nope_mask, other=0)
@@ -208,6 +213,12 @@ class PCPPeerCacheFence:
             MAX_SPINS=_MAX_FENCE_SPINS,
         )
 
+    def reset(self) -> None:
+        self._epoch.zero_()
+        self._allocation.storage.zero_()
+        torch.accelerator.synchronize()
+        dist.barrier(group=self._group)
+
     def close(self) -> None:
         torch.accelerator.synchronize(self._allocation.storage.device)
         # Cleanup must remain non-collective: a peer may already have failed
@@ -304,11 +315,13 @@ def gather_pcp_sharded_peer_cache(
     if dst.dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise ValueError(f"Unsupported PCP peer gather output dtype: {dst.dtype}")
     row_dim = dst.shape[1]
-    cache_entry_bytes = cache.shape[-1] * cache.element_size()
-    if packed_ds_mla and (row_dim != 576 or cache_entry_bytes != 656):
+    cache_row_bytes = cache.shape[-1] * cache.element_size()
+    cache_block_stride_bytes = cache.stride(0) * cache.element_size()
+    cache_token_stride_bytes = cache.stride(1) * cache.element_size()
+    if packed_ds_mla and (row_dim != 576 or cache_row_bytes != 656):
         raise ValueError(
             "fp8_ds_mla peer gather requires 576 output elements and a "
-            f"656-byte cache entry; got {row_dim} and {cache_entry_bytes}"
+            f"656-byte cache entry; got {row_dim} and {cache_row_bytes}"
         )
     if dst.shape[0] < num_tokens:
         raise ValueError(
@@ -317,9 +330,7 @@ def gather_pcp_sharded_peer_cache(
     if block_table.ndim != 2:
         raise ValueError("PCP sharded peer gather requires a 2-D block table")
     block = 256
-    _gather_sharded_peer_cache_kernel[
-        (num_tokens, triton.cdiv(row_dim, block))
-    ](
+    _gather_sharded_peer_cache_kernel[(num_tokens, triton.cdiv(row_dim, block))](
         peer_ptrs,
         dst,
         block_table,
@@ -329,8 +340,9 @@ def gather_pcp_sharded_peer_cache(
         scale,
         block_table_stride=block_table.stride(0),
         cache_block_size=cache_block_size,
+        cache_block_stride_bytes=cache_block_stride_bytes,
+        cache_token_stride_bytes=cache_token_stride_bytes,
         row_dim=row_dim,
-        cache_entry_bytes=cache_entry_bytes,
         world_size=peer_ptrs.numel(),
         interleave_size=_STATE.interleave_size,
         packed_ds_mla=packed_ds_mla,
@@ -447,6 +459,11 @@ def publish_pcp_sharded_peer_kv() -> None:
     """Publish local DCP cache writes before asynchronous peer reads."""
     if pcp_sharded_peer_kv_active() and _STATE.fence is not None:
         _STATE.fence()
+
+
+def reset_pcp_peer_cache_fence() -> None:
+    if _STATE.fence is not None:
+        _STATE.fence.reset()
 
 
 def should_allocate_pcp_direct_kv(vllm_config) -> bool:

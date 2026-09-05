@@ -112,6 +112,7 @@ def eager_break_during_capture(fn: F) -> F:
             k: weak_ref_tensor(v) if isinstance(v, torch.Tensor) else v
             for k, v in kwargs.items()
         }
+
         return capture.add_eager(lambda: fn(*weak_args, **weak_kwargs))
 
     return wrapper  # type: ignore[return-value]
