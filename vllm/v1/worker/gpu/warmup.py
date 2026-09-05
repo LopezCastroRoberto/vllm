@@ -218,6 +218,14 @@ def warmup_kernels(
     # length exceeds decode_query_len, preventing it from being misclassified as
     # a uniform decode batch.
     prompt_len = decode_query_len + 1
+    pcp_size = model_runner.vllm_config.parallel_config.prefill_context_parallel_size
+    if pcp_size > 1:
+        # DualChunkSwap divides a prefill into 2 * PCP chunks. Pad the
+        # synthetic prompt to a complete round so every PCP/DCP rank receives
+        # the same request geometry and executes an identical collective
+        # schedule during startup warmup.
+        pcp_round = 2 * pcp_size
+        prompt_len = cdiv(prompt_len, pcp_round) * pcp_round
     prompt_token_ids = list(range(prompt_len))
     # Upper bound on the decode steps built in `decode_steps` below.
     num_decode_steps = 1

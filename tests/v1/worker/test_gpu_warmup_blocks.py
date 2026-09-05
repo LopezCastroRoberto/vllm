@@ -71,6 +71,7 @@ def _make_runner(
     kv_cache_groups: list[KVCacheGroupSpec],
     num_lookahead_tokens: int,
     num_spec_steps: int = NUM_SPEC_STEPS,
+    pcp_size: int = 1,
 ) -> SimpleNamespace:
     """Stub model runner exposing only what the warmup entry points read."""
     return SimpleNamespace(
@@ -88,7 +89,11 @@ def _make_runner(
             kv_cache_groups=kv_cache_groups, num_blocks=1024
         ),
         vllm_config=SimpleNamespace(
-            num_lookahead_tokens=num_lookahead_tokens, is_mm_encoder_only=False
+            num_lookahead_tokens=num_lookahead_tokens,
+            is_mm_encoder_only=False,
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=pcp_size
+            ),
         ),
         kv_block_zeroer=None,
         kv_connector=SimpleNamespace(set_disabled=lambda disabled: None),
@@ -158,6 +163,20 @@ def test_warmup_kernels_reserves_lookahead_blocks(num_spec_steps, extra_lookahea
     )
 
     _assert_covers_lookahead(recorder.steps, num_lookahead_tokens)
+
+
+def test_pcp_warmup_prefill_uses_complete_dual_chunk_round():
+    recorder = _StepRecorder()
+
+    warmup_kernels(
+        _make_runner(
+            [_attention_group()], NUM_SPEC_STEPS, num_spec_steps=7, pcp_size=4
+        ),
+        recorder.execute_model,
+        recorder.sample_tokens,
+    )
+
+    assert recorder.steps[0][2] == 16
 
 
 def test_mixed_warmup_reserves_lookahead_blocks():

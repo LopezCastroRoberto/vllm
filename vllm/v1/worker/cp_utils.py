@@ -156,6 +156,7 @@ def split_dcp_context_queries(
     seq_lens_cpu_upper_bound: torch.Tensor | None,
     max_query_len: int,
     num_actual_tokens: int,
+    is_prefilling: torch.Tensor | None = None,
 ) -> tuple[int, int, int, int]:
     """Split reordered DCP context queries into decode and extend regions."""
     num_reqs = query_start_loc.shape[0] - 1
@@ -163,6 +164,34 @@ def split_dcp_context_queries(
         return num_reqs, 0, num_actual_tokens, 0
     if seq_lens_cpu_upper_bound is None:
         return 0, num_reqs, 0, num_actual_tokens
+
+    if is_prefilling is not None:
+        # Multi-token speculative verification/proposal batches are decodes,
+        # even though their query length is greater than one. In particular,
+        # DSpark submits the anchor and all mask queries in one forward and
+        # explicitly marks them as non-prefill. Do not infer their phase from
+        # query length, or DCP will route them through the extend-only path.
+        prefill_mask = is_prefilling[:num_reqs].to(device="cpu", dtype=torch.bool)
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        seq_lens = seq_lens_cpu_upper_bound[:num_reqs]
+        pure_prefill_mask = prefill_mask & (seq_lens == query_lens)
+        extend_mask = prefill_mask & ~pure_prefill_mask
+
+        num_decodes = int((~prefill_mask).sum().item())
+        num_extends = int(extend_mask.sum().item())
+        # PCP/DCP batches are ordered as decode, extend, then pure prefill.
+        # Keep the boundary-based token counts used by the split FA2 path.
+        first_extend = num_decodes
+        first_prefill = num_decodes + num_extends
+        if torch.any(prefill_mask[:num_decodes]):
+            raise ValueError("DCP batch must place decode requests first")
+        if torch.any(pure_prefill_mask[:first_prefill]):
+            raise ValueError("DCP batch must place pure prefill requests last")
+        num_decode_tokens = int(query_start_loc[first_extend].item())
+        num_extend_tokens = int(
+            query_start_loc[first_prefill].item() - num_decode_tokens
+        )
+        return num_decodes, num_extends, num_decode_tokens, num_extend_tokens
 
     common_attn_metadata = cast(
         CommonAttentionMetadata,

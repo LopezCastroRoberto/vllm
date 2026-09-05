@@ -1363,6 +1363,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.pcp_manager,
             input_batch,
             padded_num_tokens=batch_desc.num_tokens,
+            adaptive_verification=adaptive_verification is not None,
         )
 
     def prepare_attn(

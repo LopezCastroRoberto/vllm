@@ -10,6 +10,7 @@ from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
     should_skip_dcp_context_attention,
+    split_dcp_context_queries,
 )
 
 
@@ -159,3 +160,43 @@ def test_skip_gate_rank_invariant_with_divergent_local_context(
     assert max(local_maxes) > 0
     # The batch still has context globally, so no rank may skip.
     assert not should_skip_dcp_context_attention(context_kv_lens)
+
+
+def test_split_dcp_multitoken_dspark_queries_as_decodes():
+    query_start_loc = torch.tensor([0, 8, 16], dtype=torch.int32)
+    seq_lens = torch.tensor([108, 208], dtype=torch.int32)
+
+    assert split_dcp_context_queries(
+        query_start_loc,
+        seq_lens,
+        max_query_len=8,
+        num_actual_tokens=16,
+        is_prefilling=torch.zeros(2, dtype=torch.bool),
+    ) == (2, 0, 16, 0)
+
+
+def test_split_dcp_mixed_multitoken_queries_uses_explicit_phase():
+    # Two 8-token speculative decodes, one 8-token extend, and one pure
+    # prefill. Only the extend contributes cached-context attention here.
+    query_start_loc = torch.tensor([0, 8, 16, 24, 32], dtype=torch.int32)
+    seq_lens = torch.tensor([108, 208, 58, 8], dtype=torch.int32)
+
+    assert split_dcp_context_queries(
+        query_start_loc,
+        seq_lens,
+        max_query_len=8,
+        num_actual_tokens=32,
+        is_prefilling=torch.tensor([False, False, True, True]),
+    ) == (2, 1, 16, 8)
+
+
+def test_split_dcp_without_explicit_phase_preserves_length_inference():
+    query_start_loc = torch.tensor([0, 1, 9, 17], dtype=torch.int32)
+    seq_lens = torch.tensor([101, 58, 8], dtype=torch.int32)
+
+    assert split_dcp_context_queries(
+        query_start_loc,
+        seq_lens,
+        max_query_len=8,
+        num_actual_tokens=17,
+    ) == (1, 1, 1, 8)

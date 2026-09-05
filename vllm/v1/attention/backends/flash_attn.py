@@ -77,6 +77,38 @@ from vllm.v1.worker.cp_utils import (
 logger = init_logger(__name__)
 
 
+def _get_split_dcp_context_window(
+    sliding_window: list[int] | None,
+    *,
+    causal: bool,
+    max_query_len: int,
+    num_query_tokens: int,
+    num_reqs: int,
+    num_prefill_reqs: int,
+) -> list[int] | None:
+    """Align a context-only FlashAttention window with a detached Q block."""
+    if (
+        sliding_window is None
+        or not causal
+        or num_prefill_reqs > 0
+        or max_query_len < 1
+        or num_query_tokens != num_reqs * max_query_len
+        or max_query_len > sliding_window[0]
+    ):
+        return sliding_window
+
+    # The DCP path evaluates cached context and the current query block in
+    # separate attention calls. FlashAttention bottom-right aligns a Q block
+    # of length Q with its K block, so the regular causal window (W-1, 0)
+    # makes query row 0 miss the newest Q-1 cached tokens. Shift the
+    # context-only window right while preserving the combined context+query
+    # causal window. This is exact for uniform decode/speculative Q blocks.
+    return [
+        sliding_window[0] - max_query_len,
+        sliding_window[1] + max_query_len - 1,
+    ]
+
+
 class FlashAttentionBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
@@ -615,6 +647,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                     common_attn_metadata.seq_lens_cpu_upper_bound,
                     max_query_len,
                     num_actual_tokens,
+                    common_attn_metadata.is_prefilling,
                 )
 
             # After DCP distribution, the maximum number of tokens for any rank is
@@ -1257,6 +1290,14 @@ class FlashAttentionImpl(AttentionImpl):
         num_reqs = cu_seqlens_q.shape[0] - 1
         num_decodes = attn_metadata.num_decode_reqs
         num_context_prefills = attn_metadata.num_prefill_reqs
+        context_sliding_window_size = _get_split_dcp_context_window(
+            sliding_window_size,
+            causal=attn_metadata.causal,
+            max_query_len=max_seqlen_q,
+            num_query_tokens=n,
+            num_reqs=num_reqs,
+            num_prefill_reqs=num_context_prefills,
+        )
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_context_prefill_tokens = attn_metadata.num_prefill_tokens
         split_dcp_context = should_split_fa2_dcp_context_attention(
@@ -1298,7 +1339,7 @@ class FlashAttentionImpl(AttentionImpl):
                 attn_metadata.max_dcp_context_kv_len,
                 self.scale,
                 self.alibi_slopes,
-                sliding_window_size,
+                context_sliding_window_size,
                 block_table,
                 self.logits_soft_cap,
                 self.vllm_flash_attn_version,
@@ -1326,7 +1367,7 @@ class FlashAttentionImpl(AttentionImpl):
                 softmax_scale=self.scale,
                 causal=False,
                 alibi_slopes=self.alibi_slopes,
-                window_size=sliding_window_size,
+                window_size=context_sliding_window_size,
                 block_table=block_table,
                 softcap=self.logits_soft_cap,
                 return_softmax_lse=True,
