@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -9,7 +10,7 @@ from transformers import DeepseekV2Config, DeepseekV3Config
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.parallel_state import get_pcp_group, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.attention.attention import get_attention_context
@@ -48,6 +49,17 @@ from vllm.v1.attention.ops.pcp import (
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
+
+
+def _pcp_stage_debug_sync(label: str) -> None:
+    if (
+        os.environ.get("VLLM_PCP_STAGE_DEBUG") != "1"
+        or not os.path.exists("/tmp/PCP_STAGE_ON")
+    ):
+        return
+    print(f"[PCP-STAGE before {label}]", flush=True)
+    torch.cuda.synchronize()
+    print(f"[PCP-STAGE after {label}]", flush=True)
 
 
 class DeepseekV32Indexer(nn.Module):
@@ -332,6 +344,19 @@ class DeepseekV32Attention(MLAAttention):
             and bool(getattr(prefill_metadata, "use_dense_mha", False))
             and self.pcp_spans_dcp
         )
+        import vllm.model_executor.layers.attention.pcp_direct_kv as _pk  # __PCP_DBG_INSTRUMENT__
+        if _pk._dbg_on() and _pk._DBG["lines"] < 5000:
+            try:
+                _pk._DBG["lines"] += 1
+                _r, _s, _d = _pk._pcp_dbg_snapshot()
+                _npt = (-1 if prefill_metadata is None else
+                        int(getattr(prefill_metadata, "num_actual_tokens", -1) or -1))
+                _cap = torch.cuda.is_current_stream_capturing()
+                print(f"[V32 rank={_r} L={self.layer_name} dense={use_dense_prefill}"
+                      f" pm={prefill_metadata is not None} npt={_npt}"
+                      f" shf={_s} dif={_d} cap={_cap}]", flush=True)
+            except Exception:
+                pass
 
         slot_mapping = forward_context.slot_mapping
         assert isinstance(slot_mapping, dict)
@@ -521,6 +546,7 @@ class DeepseekV32Attention(MLAAttention):
         mqa_q: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
+        _pcp_stage_debug_sync(f"{self.layer_name}:entry")
         if self.indexer is not None and not self.skip_topk:
             assert index_q_fp8 is not None
             assert index_weights_out is not None
@@ -558,6 +584,7 @@ class DeepseekV32Attention(MLAAttention):
                 ),
                 skip_topk_buffer_clear=True,
             )
+            _pcp_stage_debug_sync(f"{self.layer_name}:indexer")
 
         attn_metadata, _, kv_cache, layer_slot_mapping = get_attention_context(
             self.layer_name
@@ -586,6 +613,7 @@ class DeepseekV32Attention(MLAAttention):
                 self.kv_cache_dtype,
                 self._k_scale,
             )
+            _pcp_stage_debug_sync(f"{self.layer_name}:kv_update")
             # Rank-symmetric peer-cache fence # __DCP4_SPARSE_FENCE_FIX__: publish this
             # rank's sharded DCP KV writes before any peer reads them in
             # forward_mqa. The dense path fences here unconditionally; the
@@ -608,21 +636,48 @@ class DeepseekV32Attention(MLAAttention):
             )
             if BreakableCUDAGraphCapture.current() is None:
                 publish_pcp_sharded_peer_kv()
+                _pcp_stage_debug_sync(f"{self.layer_name}:peer_fence")
 
         num_actual = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
-        if num_actual == 0:
+        pcp_token_sharded = (
+            self.use_pcp
+            and self.impl.dcp_world_size > 1
+            and self.impl.dcp_world_size == self.impl.pcp_world_size
+            and attn_metadata.num_prefills > 0
+            and attn_metadata.num_decodes == 0
+        )
+        if num_actual == 0 and not pcp_token_sharded:
             output.zero_()
             return
 
         if self._fp8_kv_needs_view:
             kv_cache = kv_cache.view(torch.float8_e4m3fn)
+        query_rows = output.shape[0] if pcp_token_sharded else num_actual
         if self._fp8_query:
             # FlashInfer sparse: single packed fp8 query.
             mqa_q_arg: torch.Tensor | tuple[torch.Tensor, torch.Tensor] = mqa_q[
-                :num_actual
+                :query_rows
             ]
         else:
-            mqa_q_arg = (ql_nope[:num_actual], mqa_q[:num_actual])
+            mqa_q_arg = (ql_nope[:query_rows], mqa_q[:query_rows])
+
+        if pcp_token_sharded:
+            attn_out = self.impl.forward_mqa_token_sharded(  # type: ignore[attr-defined]
+                mqa_q_arg,
+                kv_cache,
+                attn_metadata,
+                self,
+                get_pcp_group(),
+                query_rows,
+                self.W_UV,
+            )
+            if num_actual > 0:
+                output[:num_actual].view(
+                    num_actual, self.num_local_heads, self.v_head_dim
+                ).copy_(attn_out)
+            if num_actual < output.shape[0]:
+                output[num_actual:].zero_()
+            return
 
         if self.use_pcp and self.impl.dcp_world_size > self.impl.pcp_world_size:
             if isinstance(mqa_q_arg, tuple):
@@ -631,6 +686,7 @@ class DeepseekV32Attention(MLAAttention):
         attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
             mqa_q_arg, kv_cache, attn_metadata, self
         )
+        _pcp_stage_debug_sync(f"{self.layer_name}:forward_mqa")
 
         if self.use_pcp and self.impl.dcp_world_size > 1:
             assert lse is not None and self.dcp_manager is not None
@@ -668,6 +724,7 @@ class DeepseekV32Attention(MLAAttention):
                 query_start_loc=query_start_loc,
             )
             attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
+            _pcp_stage_debug_sync(f"{self.layer_name}:dcp_combine")
 
         # NOTE(woosuk): While the below does not need to be in the eager region,
         # we put it here to avoid copying the attention output. Move this back to the
@@ -681,5 +738,6 @@ class DeepseekV32Attention(MLAAttention):
             .transpose(0, 1)
         )
         torch.bmm(x, self.W_UV, out=out)
+        _pcp_stage_debug_sync(f"{self.layer_name}:output_bmm")
         if self.use_pcp and num_actual < output.shape[0]:
             output[num_actual:].zero_()

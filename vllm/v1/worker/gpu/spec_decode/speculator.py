@@ -92,6 +92,22 @@ class DraftModelSpeculator(BaseSpeculator):
                     prefill_context_parallel_size=1,
                 ),
             )
+        # FlashInfer's native DCP prefill reads FP8 KV through FA2, which
+        # requires model-dtype queries. Keep this draft-local so the target's
+        # sparse MLA query quantization remains enabled.
+        if (
+            speculative_config is not None
+            and speculative_config.use_dspark()
+            and target_parallel_config.decode_context_parallel_size > 1
+            and vllm_config.cache_config.cache_dtype.startswith("fp8")
+        ):
+            vllm_config = replace(
+                vllm_config,
+                attention_config=replace(
+                    vllm_config.attention_config,
+                    disable_flashinfer_q_quantization=True,
+                ),
+            )
         self.vllm_config = vllm_config
         self.device = device
 

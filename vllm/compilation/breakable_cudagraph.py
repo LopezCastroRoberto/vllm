@@ -25,6 +25,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import gc
+import os
 import threading
 import weakref
 from collections.abc import Callable
@@ -113,7 +114,10 @@ def eager_break_during_capture(fn: F) -> F:
             for k, v in kwargs.items()
         }
 
-        return capture.add_eager(lambda: fn(*weak_args, **weak_kwargs))
+        return capture.add_eager(
+            lambda: fn(*weak_args, **weak_kwargs),
+            label=fn.__qualname__,
+        )
 
     return wrapper  # type: ignore[return-value]
 
@@ -151,6 +155,7 @@ class BreakableCUDAGraphCapture:
     def __init__(self, pool: Any | None = None) -> None:
         self.pool = pool
         self.segments: list[Callable[[], Any]] = []
+        self._segment_labels: list[str] = []
         self._num_graphs: int = 0
         self._num_eager_breaks: int = 0
         self._current_graph: torch.cuda.CUDAGraph | None = None
@@ -189,11 +194,12 @@ class BreakableCUDAGraphCapture:
         assert self._current_graph is not None
         self._current_graph.capture_end()
         self.segments.append(self._current_graph.replay)
+        self._segment_labels.append(f"graph[{self._num_graphs}]")
         self._num_graphs += 1
         self._current_graph = None
         self._capturing = False
 
-    def add_eager(self, fn: Callable[[], Any]) -> Any:
+    def add_eager(self, fn: Callable[[], Any], label: str = "eager") -> Any:
         """End the current capture segment, run ``fn`` eagerly on the
         capture stream, record ``fn`` for replay, and start a new segment.
 
@@ -204,6 +210,7 @@ class BreakableCUDAGraphCapture:
         self._end_segment()
         result = fn()
         self.segments.append(fn)
+        self._segment_labels.append(label)
         self._num_eager_breaks += 1
         self._begin_segment()
         return result
@@ -211,8 +218,18 @@ class BreakableCUDAGraphCapture:
     # --- replay ----------------------------------------------------------
 
     def replay(self) -> None:
-        for r in self.segments:
+        debug_segments = os.environ.get("VLLM_BCG_SEGMENT_DEBUG") == "1"
+        for index, (r, label) in enumerate(
+            zip(self.segments, self._segment_labels, strict=True)
+        ):
+            if debug_segments:
+                print(
+                    f"[BCG-SEGMENT before index={index} label={label}]", flush=True
+                )
             r()
+            if debug_segments:
+                torch.cuda.synchronize()
+                print(f"[BCG-SEGMENT after index={index} label={label}]", flush=True)
 
     # --- introspection ---------------------------------------------------
 
