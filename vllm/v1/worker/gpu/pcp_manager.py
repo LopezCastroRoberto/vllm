@@ -1118,11 +1118,6 @@ def _validate_pcp_direct_kv_config(vllm_config: VllmConfig) -> None:
         raise NotImplementedError(
             "Direct PCP KV requires --kv-cache-dtype fp8 or fp8_ds_mla."
         )
-    if cache_config.enable_prefix_caching:
-        raise NotImplementedError(
-            "Direct PCP KV does not support prefix caching or copy-on-write. "
-            "Set --no-enable-prefix-caching."
-        )
     kv_transfer_config = vllm_config.kv_transfer_config
     if (
         kv_transfer_config is not None

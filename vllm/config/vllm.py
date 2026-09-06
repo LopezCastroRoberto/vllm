@@ -1292,15 +1292,6 @@ class VllmConfig:
                     "Disabling async scheduling because PCP direct-KV is enabled."
                 )
                 self.scheduler_config.async_scheduling = False
-            if (
-                self.cache_config is not None
-                and self.cache_config.enable_prefix_caching
-            ):
-                logger.warning_once(
-                    "Disabling prefix caching because PCP direct-KV does not yet "
-                    "support copy-on-write."
-                )
-                self.cache_config.enable_prefix_caching = False
 
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.

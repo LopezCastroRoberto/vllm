@@ -295,6 +295,32 @@ def test_direct_pcp_kv_allows_nixl_producer_only(monkeypatch, connector, role, a
 
 
 @pytest.mark.parametrize("dcp_world_size", [1, 4])
+def test_direct_pcp_kv_allows_prefix_caching(monkeypatch, dcp_world_size):
+    monkeypatch.setattr(
+        pcp_manager_module.current_platform, "is_cuda", lambda: True
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            prefill_context_parallel_size=4,
+            decode_context_parallel_size=dcp_world_size,
+            data_parallel_size=1,
+            use_ubatching=False,
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type="glm_moe_dsa"),
+            enable_sleep_mode=False,
+        ),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        cache_config=SimpleNamespace(cache_dtype="fp8", enable_prefix_caching=True),
+        kv_transfer_config=None,
+    )
+
+    pcp_manager_module._validate_pcp_direct_kv_config(config)
+
+
+@pytest.mark.parametrize("dcp_world_size", [1, 4])
 def test_sparse_mla_pcp_accepts_mtp(dcp_world_size):
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(

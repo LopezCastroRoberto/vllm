@@ -1099,7 +1099,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
-        # zeroing new blocks and before the forward pass reads them.
+        # zeroing new blocks and before the forward pass reads them. PCP ranks
+        # receive the same scheduler output, so this local copy preserves both
+        # direct-KV layouts: every rank copies its complete replica when DCP=1,
+        # while DCP=PCP copies the rank-owned shard. The per-layer direct-KV
+        # publication fence orders those local copies before another rank can
+        # consume the destination block through peer memory.
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
                 self.kv_caches,
