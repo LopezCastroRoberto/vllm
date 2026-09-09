@@ -6,11 +6,12 @@ from typing import Any
 
 import torch
 
-from vllm.model_executor.warmup.jit_warmup import kernel_launcher
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     LaunchSpec,
     TritonWarmupTensor,
     VllmTritonJitKernel,
+    kernel_launcher,
+    simple_triton_jit_kernel,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -1518,6 +1519,25 @@ def fused_q(
     return index_q_fp8, index_weights_out, mqa_q
 
 
+def _fused_eh_norm_warmup_inputs(vllm_config: Any) -> dict[str, object]:
+    speculative_config = vllm_config.speculative_config
+    assert speculative_config is not None
+    draft_model_config = speculative_config.draft_model_config
+    h = draft_model_config.hf_config.hidden_size
+    dtype = draft_model_config.dtype
+    hidden = TritonWarmupTensor(dtype, shape=(1, h))
+    return {
+        "positions": TritonWarmupTensor(torch.int64),
+        "inputs_embeds": hidden,
+        "previous_hidden": hidden,
+        "enorm_w": hidden,
+        "hnorm_w": hidden,
+        "eps": 0.0,
+        "out": TritonWarmupTensor(dtype, shape=(1, 2 * h)),
+    }
+
+
+@simple_triton_jit_kernel(warmup_inputs=_fused_eh_norm_warmup_inputs)
 @triton.jit
 def _fused_eh_norm_kernel(
     pos_ptr,
@@ -1553,81 +1573,31 @@ def _fused_eh_norm_kernel(
     tl.store(out_ptr + tok * out_stride + H + off, p_normed, mask=mask)
 
 
-class FusedEhNormKernel(VllmTritonJitKernel["FusedEhNormKernel.CompileKey"]):
-    """Warmup owner for the MTP embed/hidden RMSNorm fusion."""
-    kernel = staticmethod(_fused_eh_norm_kernel)
-
-    @dataclass(frozen=True)
-    class CompileKey:
-        hidden_size: int
-        block_size: int
-        dtype: torch.dtype
-
-    def dispatch(
-        self,
-        *,
-        h: int,
-        dtype: torch.dtype,
-    ) -> CompileKey:  # type: ignore[override]
-        return self.CompileKey(
-            hidden_size=h,
-            block_size=triton.next_power_of_2(h),
-            dtype=dtype,
-        )
-
-    def get_warmup_keys(self, vllm_config: Any) -> list[CompileKey]:
-        speculative_config = vllm_config.speculative_config
-        assert speculative_config is not None
-        draft_model_config = speculative_config.draft_model_config
-        return self._trace_dispatch(self.dispatch)(
-            h=draft_model_config.hf_config.hidden_size,
-            dtype=draft_model_config.dtype,
-        )
-
-    def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
-        hidden = TritonWarmupTensor(
-            compile_key.dtype,
-            shape=(1, compile_key.hidden_size),
-        )
-        return dict(
-            positions=TritonWarmupTensor(torch.int64),
-            inputs_embeds=hidden,
-            previous_hidden=hidden,
-            enorm_w=hidden,
-            hnorm_w=hidden,
-            eps=0.0,
-            out=TritonWarmupTensor(
-                compile_key.dtype,
-                shape=(1, 2 * compile_key.hidden_size),
-            ),
-        )
-
-    @kernel_launcher
-    def __call__(
-        self,
-        positions: torch.Tensor,
-        inputs_embeds: torch.Tensor,
-        previous_hidden: torch.Tensor,
-        enorm_w: torch.Tensor,
-        hnorm_w: torch.Tensor,
-        eps: float,
-        out: torch.Tensor,
-    ) -> LaunchSpec:
-        n, h = inputs_embeds.shape
-        return (n,), dict(
-            pos_ptr=positions,
-            embeds_ptr=inputs_embeds,
-            embeds_stride=inputs_embeds.stride(0),
-            prev_ptr=previous_hidden,
-            prev_stride=previous_hidden.stride(0),
-            enorm_w_ptr=enorm_w,
-            hnorm_w_ptr=hnorm_w,
-            eps=eps,
-            out_ptr=out,
-            out_stride=out.stride(0),
-            H=h,
-            BLOCK=triton.next_power_of_2(h),
-        )
+@_fused_eh_norm_kernel.launcher
+def _FUSED_EH_NORM_KERNEL(
+    positions: torch.Tensor,
+    inputs_embeds: torch.Tensor,
+    previous_hidden: torch.Tensor,
+    enorm_w: torch.Tensor,
+    hnorm_w: torch.Tensor,
+    eps: float,
+    out: torch.Tensor,
+) -> LaunchSpec:
+    n, h = inputs_embeds.shape
+    return (n,), dict(
+        pos_ptr=positions,
+        embeds_ptr=inputs_embeds,
+        embeds_stride=inputs_embeds.stride(0),
+        prev_ptr=previous_hidden,
+        prev_stride=previous_hidden.stride(0),
+        enorm_w_ptr=enorm_w,
+        hnorm_w_ptr=hnorm_w,
+        eps=eps,
+        out_ptr=out,
+        out_stride=out.stride(0),
+        H=h,
+        BLOCK=triton.next_power_of_2(h),
+    )
 
 
 def fused_eh_norm(
@@ -1655,4 +1625,3 @@ def fused_eh_norm(
 
 _FUSED_NORM_ROPE_KERNEL = FusedNormRopeKernel()
 _FUSED_Q_TRITON_KERNEL = FusedQTritonKernel()
-_FUSED_EH_NORM_KERNEL = FusedEhNormKernel()

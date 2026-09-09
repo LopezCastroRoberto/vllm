@@ -10,11 +10,13 @@ from typing import Any
 
 import torch
 
-from vllm.model_executor.warmup.jit_warmup import kernel_launcher
 from vllm.model_executor.warmup.jit_warmup_cutedsl_helper import (
     CuTeDSLLaunchSpec,
     VllmCuTeDSLJitKernel,
     compile_cutedsl,
+)
+from vllm.model_executor.warmup.jit_warmup_cutedsl_helper import (
+    cutedsl_kernel_launcher as kernel_launcher,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,9 +34,7 @@ class SkinnyGemmConfig:
     static_k: int | None = None
 
 
-class ShapeDynamicSkinnyGemm(
-    VllmCuTeDSLJitKernel["ShapeDynamicSkinnyGemm.CompileKey"]
-):
+class ShapeDynamicSkinnyGemm(VllmCuTeDSLJitKernel["ShapeDynamicSkinnyGemm.CompileKey"]):
     compile_options = "--enable-tvm-ffi --ptxas-options -maxrregcount=64"
 
     @dataclass(frozen=True)
@@ -129,7 +129,7 @@ class ShapeDynamicSkinnyGemm(
             static_k=config.static_k,
         )
 
-    def dispatch(
+    def dispatch(  # type: ignore[override]
         self,
         *,
         dtype: torch.dtype,
@@ -255,13 +255,17 @@ class ShapeDynamicSkinnyGemm(
             has_residual=residual is not None,
             use_pdl=self._use_pdl(),
         )
-        return compile_key, (
-            a,
-            b,
-            output if residual is None else residual,
+        return (
+            compile_key,
+            (
+                a,
+                b,
+                output if residual is None else residual,
+                output,
+                self._stream(),
+            ),
             output,
-            self._stream(),
-        ), output
+        )
 
 
 shape_dynamic_skinny_gemm = ShapeDynamicSkinnyGemm()

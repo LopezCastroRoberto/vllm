@@ -13,18 +13,16 @@
 # This backward pass is faster for dimensions up to 8k, but after that it's much slower due to register spilling.
 # The models we train have hidden dim up to 8k anyway (e.g. Llama 70B), so this is fine.
 
-from dataclasses import dataclass
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from vllm.model_executor.warmup.jit_warmup import VllmJitKernel
+from vllm.model_executor.warmup.jit_warmup import WarmupIntRange
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
-    TritonPointerInputVariant,
+    LaunchSpec,
     TritonWarmupTensor,
-    triton_scalar_specialization_rep,
+    simple_triton_jit_kernel,
 )
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv, next_power_of_2
@@ -65,6 +63,53 @@ def rms_norm_ref(
     return out.to(dtype)
 
 
+def _layer_norm_warmup_inputs(
+    *,
+    num_tokens: int,
+    rows_per_token: int,
+    group_size: int,
+    x_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    device: torch.device,
+    norm_before_gate: bool,
+    is_rms_norm: bool,
+    activation: str,
+) -> dict[str, object] | tuple[()]:
+    if num_tokens < 1 or rows_per_token < 1:
+        return ()
+    max_fused_size = 65536 // x_dtype.itemsize
+    block_n = min(max_fused_size, triton.next_power_of_2(group_size))
+    if group_size > block_n:
+        return ()
+
+    num_rows = num_tokens * rows_per_token
+    row = TritonWarmupTensor(x_dtype, shape=(num_rows, group_size))
+    return {
+        "x": row,
+        "out": row,
+        "weight": TritonWarmupTensor(weight_dtype, shape=(group_size,)),
+        "bias": None,
+        "z": row,
+        "_mean": (
+            None
+            if is_rms_norm
+            else TritonWarmupTensor(torch.float32, shape=(num_rows,))
+        ),
+        "_rstd": TritonWarmupTensor(torch.float32, shape=(num_rows,)),
+        "eps": 1e-5,
+        "group_size": group_size,
+        "norm_before_gate": norm_before_gate,
+        "is_rms_norm": is_rms_norm,
+        "activation": activation,
+        "_block_n": block_n,
+        "_rows_per_block": calc_rows_per_block(num_rows, device),
+    }
+
+
+@simple_triton_jit_kernel(
+    warmup_inputs=_layer_norm_warmup_inputs,
+    capture_specializations=True,
+)
 @triton.heuristics(
     {
         "HAS_BIAS": lambda args: args["B"] is not None,
@@ -183,263 +228,7 @@ def calc_rows_per_block(M: int, device: torch.device) -> int:
     return rows_per_block
 
 
-class LayerNormFwdKernel(VllmJitKernel["LayerNormFwdKernel.CompileKey"]):
-    """Own the runtime and compile-only dispatch for FLA layer norm."""
-
-    @dataclass(frozen=True)
-    class CompileKey:
-        x_dtype: torch.dtype
-        y_dtype: torch.dtype
-        weight_dtype: torch.dtype
-        bias_dtype: torch.dtype | None
-        z_dtype: torch.dtype | None
-        mean_dtype: torch.dtype | None
-        rstd_dtype: torch.dtype
-        input_variant: TritonPointerInputVariant
-        stride_x_row: int
-        stride_y_row: int
-        stride_z_row: int
-        M: int
-        N: int
-        BLOCK_N: int
-        ROWS_PER_BLOCK: int
-        NORM_BEFORE_GATE: bool
-        IS_RMS_NORM: bool
-        ACTIVATION: str
-
-    kernel = staticmethod(layer_norm_fwd_kernel)
-
-    def dispatch(  # type: ignore[override]
-        self,
-        *,
-        x_dtype: torch.dtype,
-        y_dtype: torch.dtype,
-        weight_dtype: torch.dtype,
-        bias_dtype: torch.dtype | None,
-        z_dtype: torch.dtype | None,
-        mean_dtype: torch.dtype | None,
-        rstd_dtype: torch.dtype,
-        x_aligned: bool,
-        y_aligned: bool,
-        weight_aligned: bool,
-        bias_aligned: bool,
-        z_aligned: bool,
-        mean_aligned: bool,
-        rstd_aligned: bool,
-        stride_x_row: int,
-        stride_y_row: int,
-        stride_z_row: int,
-        M: int,
-        N: int,
-        BLOCK_N: int,
-        ROWS_PER_BLOCK: int,
-        norm_before_gate: bool,
-        is_rms_norm: bool,
-        activation: str,
-    ) -> CompileKey:
-        input_variant = TritonPointerInputVariant.from_alignment(
-            x=x_aligned,
-            y=y_aligned,
-            weight=weight_aligned,
-            bias=bias_aligned,
-            z=z_aligned,
-            mean=mean_aligned,
-            rstd=rstd_aligned,
-        )
-        return self.CompileKey(
-            x_dtype=x_dtype,
-            y_dtype=y_dtype,
-            weight_dtype=weight_dtype,
-            bias_dtype=bias_dtype,
-            z_dtype=z_dtype,
-            mean_dtype=mean_dtype,
-            rstd_dtype=rstd_dtype,
-            input_variant=input_variant,
-            stride_x_row=triton_scalar_specialization_rep(stride_x_row),
-            stride_y_row=triton_scalar_specialization_rep(stride_y_row),
-            stride_z_row=triton_scalar_specialization_rep(stride_z_row),
-            M=triton_scalar_specialization_rep(M),
-            N=N,
-            BLOCK_N=BLOCK_N,
-            ROWS_PER_BLOCK=ROWS_PER_BLOCK,
-            NORM_BEFORE_GATE=norm_before_gate,
-            IS_RMS_NORM=is_rms_norm,
-            ACTIVATION=activation,
-        )
-
-    def get_warmup_keys(
-        self,
-        *,
-        max_num_tokens: int,
-        rows_per_token: int,
-        group_size: int,
-        x_dtype: torch.dtype,
-        weight_dtype: torch.dtype,
-        device: torch.device,
-        norm_before_gate: bool,
-        is_rms_norm: bool,
-        activation: str,
-    ) -> list[CompileKey]:
-        if max_num_tokens < 1 or rows_per_token < 1:
-            return []
-
-        max_fused_size = 65536 // torch.empty((), dtype=x_dtype).element_size()
-        block_n = min(max_fused_size, triton.next_power_of_2(group_size))
-        if group_size > block_n:
-            return []
-
-        # Triton's runtime key only distinguishes three integer specialization
-        # classes. Keep one real M for each (M specialization, rows/block) pair.
-        m_values: dict[tuple[int, int], int] = {}
-        for num_tokens in range(1, max_num_tokens + 1):
-            M = num_tokens * rows_per_token
-            signature = (
-                triton_scalar_specialization_rep(M),
-                calc_rows_per_block(M, device),
-            )
-            m_values.setdefault(signature, M)
-
-        keys: dict[LayerNormFwdKernel.CompileKey, None] = {}
-        for M in m_values.values():
-            key = self.dispatch(
-                x_dtype=x_dtype,
-                y_dtype=x_dtype,
-                weight_dtype=weight_dtype,
-                bias_dtype=None,
-                z_dtype=x_dtype,
-                mean_dtype=None if is_rms_norm else torch.float32,
-                rstd_dtype=torch.float32,
-                x_aligned=True,
-                y_aligned=True,
-                weight_aligned=True,
-                bias_aligned=True,
-                z_aligned=True,
-                mean_aligned=True,
-                rstd_aligned=True,
-                stride_x_row=group_size,
-                stride_y_row=group_size,
-                stride_z_row=group_size,
-                M=M,
-                N=group_size,
-                BLOCK_N=block_n,
-                ROWS_PER_BLOCK=calc_rows_per_block(M, device),
-                norm_before_gate=norm_before_gate,
-                is_rms_norm=is_rms_norm,
-                activation=activation,
-            )
-            keys[key] = None
-        return list(keys)
-
-    def compile(self, compile_key: CompileKey) -> None:
-        warmup = getattr(self.kernel, "warmup", None)
-        assert warmup is not None
-        variant = compile_key.input_variant
-
-        def pointer(
-            name: str, dtype: torch.dtype | None
-        ) -> TritonWarmupTensor | None:
-            return None if dtype is None else variant.pointer(name, dtype)
-
-        warmup(
-            pointer("x", compile_key.x_dtype),
-            pointer("y", compile_key.y_dtype),
-            pointer("weight", compile_key.weight_dtype),
-            pointer("bias", compile_key.bias_dtype),
-            pointer("z", compile_key.z_dtype),
-            pointer("mean", compile_key.mean_dtype),
-            pointer("rstd", compile_key.rstd_dtype),
-            compile_key.stride_x_row,
-            compile_key.stride_y_row,
-            compile_key.stride_z_row,
-            compile_key.M,
-            compile_key.N,
-            1e-5,
-            BLOCK_N=compile_key.BLOCK_N,
-            ROWS_PER_BLOCK=compile_key.ROWS_PER_BLOCK,
-            HAS_BIAS=compile_key.bias_dtype is not None,
-            HAS_Z=compile_key.z_dtype is not None,
-            NORM_BEFORE_GATE=compile_key.NORM_BEFORE_GATE,
-            IS_RMS_NORM=compile_key.IS_RMS_NORM,
-            ACTIVATION=compile_key.ACTIVATION,
-            num_warps=min(max(compile_key.BLOCK_N // 256, 1), 8),
-            grid=(1, 1),
-        )
-
-    def __call__(
-        self,
-        x: torch.Tensor,
-        out: torch.Tensor,
-        weight: torch.Tensor,
-        bias: torch.Tensor | None,
-        z: torch.Tensor | None,
-        mean: torch.Tensor | None,
-        rstd: torch.Tensor,
-        eps: float,
-        group_size: int,
-        norm_before_gate: bool,
-        is_rms_norm: bool,
-        activation: str,
-    ) -> None:
-        M = x.shape[0]
-        max_fused_size = 65536 // x.element_size()
-        block_n = min(max_fused_size, triton.next_power_of_2(group_size))
-        if group_size > block_n:
-            raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-        rows_per_block = calc_rows_per_block(M, x.device)
-        grid = (cdiv(M, rows_per_block), x.shape[1] // group_size)
-        self.kernel[grid](
-            x,
-            out,
-            weight,
-            bias,
-            z,
-            mean,
-            rstd,
-            x.stride(0),
-            out.stride(0),
-            z.stride(0) if z is not None else 0,
-            M,
-            group_size,
-            eps,
-            BLOCK_N=block_n,
-            ROWS_PER_BLOCK=rows_per_block,
-            HAS_BIAS=bias is not None,
-            HAS_Z=z is not None,
-            NORM_BEFORE_GATE=norm_before_gate,
-            IS_RMS_NORM=is_rms_norm,
-            ACTIVATION=activation,
-            num_warps=min(max(block_n // 256, 1), 8),
-        )
-
-
-_LAYER_NORM_FWD_KERNEL = LayerNormFwdKernel()
-
-
-def warmup_layer_norm_fwd(
-    *,
-    max_num_tokens: int,
-    rows_per_token: int,
-    group_size: int,
-    x_dtype: torch.dtype,
-    weight_dtype: torch.dtype,
-    device: torch.device,
-    norm_before_gate: bool,
-    is_rms_norm: bool,
-    activation: str,
-) -> None:
-    _LAYER_NORM_FWD_KERNEL.warmup(
-        max_num_tokens=max_num_tokens,
-        rows_per_token=rows_per_token,
-        group_size=group_size,
-        x_dtype=x_dtype,
-        weight_dtype=weight_dtype,
-        device=device,
-        norm_before_gate=norm_before_gate,
-        is_rms_norm=is_rms_norm,
-        activation=activation,
-    )
-
-
+@layer_norm_fwd_kernel.launcher
 def layer_norm_fwd(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -451,7 +240,12 @@ def layer_norm_fwd(
     norm_before_gate: bool = True,
     is_rms_norm: bool = False,
     activation: str = "swish",
-):
+    *,
+    _mean: torch.Tensor | None = None,
+    _rstd: torch.Tensor | None = None,
+    _block_n: int | None = None,
+    _rows_per_block: int | None = None,
+) -> LaunchSpec:
     M, N = x.shape
     if group_size is None:
         group_size = N
@@ -466,34 +260,73 @@ def layer_norm_fwd(
     if bias is not None:
         assert bias.stride(-1) == 1
         assert bias.shape == (N,)
-    # allocate output
     if out is not None:
         assert out.shape == x.shape
     else:
         out = torch.empty_like(x)
     assert out.stride(-1) == 1
-    mean = (
-        torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
-        if not is_rms_norm
-        else None
-    )
-    rstd = torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
-    _LAYER_NORM_FWD_KERNEL(
-        x,
-        out,
-        weight,
-        bias,
-        z,
-        mean,
-        rstd,
-        eps,
-        group_size,
-        norm_before_gate,
-        is_rms_norm,
-        activation,
-    )
-    return out, mean, rstd
+    mean = _mean
+    if mean is None and not is_rms_norm:
+        mean = torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
+    rstd = _rstd
+    if rstd is None:
+        rstd = torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
 
+    block_n = _block_n
+    if block_n is None:
+        max_fused_size = 65536 // x.element_size()
+        block_n = min(max_fused_size, triton.next_power_of_2(group_size))
+    if group_size > block_n:
+        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+    rows_per_block = _rows_per_block or calc_rows_per_block(M, x.device)
+    grid = (cdiv(M, rows_per_block), ngroups)
+    launch_kwargs = dict(
+        X=x,
+        Y=out,
+        W=weight,
+        B=bias,
+        Z=z,
+        Mean=mean,
+        Rstd=rstd,
+        stride_x_row=x.stride(0),
+        stride_y_row=out.stride(0),
+        stride_z_row=z.stride(0) if z is not None else 0,
+        M=M,
+        N=group_size,
+        eps=eps,
+        BLOCK_N=block_n,
+        ROWS_PER_BLOCK=rows_per_block,
+        NORM_BEFORE_GATE=norm_before_gate,
+        IS_RMS_NORM=is_rms_norm,
+        ACTIVATION=activation,
+        num_warps=min(max(block_n // 256, 1), 8),
+    )
+    return grid, launch_kwargs, (out, mean, rstd)
+
+
+def warmup_layer_norm_fwd(
+    *,
+    max_num_tokens: int,
+    rows_per_token: int,
+    group_size: int,
+    x_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    device: torch.device,
+    norm_before_gate: bool,
+    is_rms_norm: bool,
+    activation: str,
+) -> None:
+    layer_norm_fwd.warmup(
+        num_tokens=WarmupIntRange(1, max_num_tokens + 1),
+        rows_per_token=rows_per_token,
+        group_size=group_size,
+        x_dtype=x_dtype,
+        weight_dtype=weight_dtype,
+        device=device,
+        norm_before_gate=norm_before_gate,
+        is_rms_norm=is_rms_norm,
+        activation=activation,
+    )
 
 def _layer_norm_fn_impl(
     x,

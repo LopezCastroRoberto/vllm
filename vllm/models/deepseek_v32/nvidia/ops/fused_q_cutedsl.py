@@ -10,10 +10,12 @@ from cuda.bindings.driver import CUstream
 from cutlass import BFloat16, Float8E4M3FN, Float32, Int64, Uint8, Uint16, Uint32
 
 from vllm.cute_utils import _TORCH_TO_CUTE_DTYPE, cvt
-from vllm.model_executor.warmup.jit_warmup import kernel_launcher
 from vllm.model_executor.warmup.jit_warmup_cutedsl_helper import (
     CuTeDSLLaunchSpec,
     VllmCuTeDSLJitKernel,
+)
+from vllm.model_executor.warmup.jit_warmup_cutedsl_helper import (
+    cutedsl_kernel_launcher as kernel_launcher,
 )
 from vllm.platforms import current_platform
 
@@ -78,12 +80,18 @@ def is_fused_q_cutedsl_supported(
         has_indexer and (index_q is None or index_q.dtype != torch.bfloat16)
     ):
         return False
+    if has_indexer:
+        assert index_q is not None
+        index_n_head = index_q.shape[1]
+        index_head_dim = index_q.shape[-1]
+    else:
+        index_n_head = index_head_dim = 0
     return is_fused_q_cutedsl_geometry_supported(
         num_q_heads=q_pe.shape[1],
         qk_rope_head_dim=q_pe.shape[-1],
         kv_lora_rank=ql_nope.shape[-1],
-        index_n_head=index_q.shape[1] if has_indexer else 0,
-        index_head_dim=index_q.shape[-1] if has_indexer else 0,
+        index_n_head=index_n_head,
+        index_head_dim=index_head_dim,
         has_indexer=has_indexer,
         quantize_mqa=quantize_mqa,
         act_dtype=q_pe.dtype,
@@ -302,7 +310,7 @@ class FusedQCuteDSLKernel(VllmCuTeDSLJitKernel["FusedQCuteDSLKernel.CompileKey"]
             idx_weights_out,
             float(idx_weights_softmax_scale * idx_weights_head_scale),
         )
-        return compile_key, launch_args
+        return compile_key, launch_args, None
 
     @cute.jit
     def host_entrypoint(

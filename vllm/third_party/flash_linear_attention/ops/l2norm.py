@@ -8,16 +8,14 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 import os
-from dataclasses import dataclass
-from typing import Any
 
 import torch
 
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     LaunchSpec,
     TritonWarmupTensor,
-    VllmTritonJitKernel,
-    kernel_launcher,
+    simple_triton_jit_kernel,
+    triton_cdiv_grid,
     triton_scalar_specialization_rep,
 )
 from vllm.triton_utils import tl, triton
@@ -25,6 +23,48 @@ from vllm.triton_utils import tl, triton
 BT_LIST = [8, 16, 32, 64, 128]
 
 USE_DEFAULT_FLA_NORM = int(os.getenv("USE_DEFAULT_FLA_NORM", "0"))
+
+
+def _l2norm_fwd_warmup_inputs(
+    *, x_dtype: torch.dtype, y_dtype: torch.dtype, eps: float, d: int, bd: int
+) -> tuple[dict[str, object], ...]:
+    return tuple(
+        {
+            "x": TritonWarmupTensor(x_dtype, shape=(t, d)),
+            "y": TritonWarmupTensor(y_dtype, shape=(t, d)),
+            "eps": eps,
+            "nb": triton.cdiv(t, 2048),
+            "t": t,
+            "d": d,
+            "bd": bd,
+        }
+        for value in (1, 2, 16)
+        for t in (triton_scalar_specialization_rep(value),)
+    )
+
+
+def _l2norm_fwd2_warmup_inputs(
+    *,
+    x_dtype: torch.dtype,
+    y_dtype: torch.dtype,
+    eps: float,
+    n: int,
+    bd: int,
+    mblock: int = 32,
+) -> tuple[dict[str, object], ...]:
+    return tuple(
+        {
+            "x": TritonWarmupTensor(x_dtype, shape=(m, n)),
+            "y": TritonWarmupTensor(y_dtype, shape=(m, n)),
+            "eps": eps,
+            "M": m,
+            "N": n,
+            "BD": bd,
+            "MBLOCK": mblock,
+        }
+        for value in (1, 2, 16)
+        for m in (triton_scalar_specialization_rep(value),)
+    )
 
 
 @triton.autotune(
@@ -56,6 +96,7 @@ def l2norm_fwd_kernel1(
     tl.store(y + cols, b_y, mask=mask)
 
 
+@simple_triton_jit_kernel(warmup_inputs=_l2norm_fwd_warmup_inputs)
 @triton.autotune(
     configs=[
         triton.Config({"BT": BT}, num_warps=num_warps)
@@ -84,6 +125,7 @@ def l2norm_fwd_kernel(
     tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
 
 
+@simple_triton_jit_kernel(warmup_inputs=_l2norm_fwd2_warmup_inputs)
 @triton.jit
 def l2norm_fwd_kernel2(
     X, Y, eps, M, N: tl.constexpr, BD: tl.constexpr, MBLOCK: tl.constexpr
@@ -101,141 +143,15 @@ def l2norm_fwd_kernel2(
     tl.store(Y + (rindex + N * row_idx), xs * rsqrt, mask)
 
 
-class FlaL2NormFwdKernel(VllmTritonJitKernel["FlaL2NormFwdKernel.CompileKey"]):
-    """JIT owner for FLA's autotuned block-row L2-norm kernel."""
-
-    kernel = staticmethod(l2norm_fwd_kernel)
-
-    @dataclass(frozen=True)
-    class CompileKey:
-        x_dtype: torch.dtype
-        y_dtype: torch.dtype
-        eps: float
-        t: int
-        d: int
-        bd: int
-
-    def dispatch(
-        self, *, x_dtype: torch.dtype, y_dtype: torch.dtype,
-        eps: float, t: int, d: int, bd: int,
-    ) -> CompileKey:
-        return self.CompileKey(
-            x_dtype=x_dtype,
-            y_dtype=y_dtype,
-            eps=eps,
-            t=triton_scalar_specialization_rep(t),
-            d=d,
-            bd=bd,
-        )
-
-    def get_warmup_keys(
-        self, *, x_dtype: torch.dtype, y_dtype: torch.dtype,
-        eps: float, d: int, bd: int,
-    ) -> list[CompileKey]:
-        return self._trace_dispatch(self.dispatch)(
-            x_dtype=x_dtype,
-            y_dtype=y_dtype,
-            eps=eps,
-            t=(1, 2, 16),
-            d=d,
-            bd=bd,
-        )
-
-    def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
-        return {
-            "x": TritonWarmupTensor(
-                compile_key.x_dtype, shape=(compile_key.t, compile_key.d)
-            ),
-            "y": TritonWarmupTensor(
-                compile_key.y_dtype, shape=(compile_key.t, compile_key.d)
-            ),
-            "eps": compile_key.eps,
-            "nb": triton.cdiv(compile_key.t, 2048),
-            "t": compile_key.t,
-            "d": compile_key.d,
-            "bd": compile_key.bd,
-        }
-
-    @kernel_launcher
-    def __call__(self, x, y, eps, nb, t, d, bd) -> LaunchSpec:
-        def grid(meta):
-            return (triton.cdiv(t, meta["BT"]),)
-
-        return grid, {"NB": nb, "T": t, "D": d, "BD": bd}
+@l2norm_fwd_kernel.launcher
+def _L2NORM_FWD_KERNEL(x, y, eps, nb, t, d, bd) -> LaunchSpec:
+    return triton_cdiv_grid((t, "BT")), {"NB": nb, "T": t, "D": d, "BD": bd}
 
 
-class FlaL2NormFwdKernel2(VllmTritonJitKernel["FlaL2NormFwdKernel2.CompileKey"]):
-    """JIT owner for the non-autotuned tiled L2-norm kernel."""
-
-    kernel = staticmethod(l2norm_fwd_kernel2)
-
-    @dataclass(frozen=True)
-    class CompileKey:
-        x_dtype: torch.dtype
-        y_dtype: torch.dtype
-        eps: float
-        m: int
-        n: int
-        bd: int
-        mblock: int
-
-    def dispatch(  # type: ignore[override]
-        self,
-        *,
-        x_dtype: torch.dtype,
-        y_dtype: torch.dtype,
-        eps: float,
-        m: int,
-        n: int,
-        bd: int,
-        mblock: int,
-    ) -> CompileKey:
-        return self.CompileKey(
-            x_dtype=x_dtype,
-            y_dtype=y_dtype,
-            eps=eps,
-            m=triton_scalar_specialization_rep(m),
-            n=n,
-            bd=bd,
-            mblock=mblock,
-        )
-
-    def get_warmup_keys(  # type: ignore[override]
-        self,
-        *,
-        x_dtype: torch.dtype,
-        y_dtype: torch.dtype,
-        eps: float,
-        n: int,
-        bd: int,
-        mblock: int = 32,
-    ) -> list[CompileKey]:
-        return self._trace_dispatch(self.dispatch)(
-            x_dtype=x_dtype,
-            y_dtype=y_dtype,
-            eps=eps,
-            m=(1, 2, 16),
-            n=n,
-            bd=bd,
-            mblock=mblock,
-        )
-
-    def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
-        ck = compile_key
-        return {
-            "x": TritonWarmupTensor(ck.x_dtype, shape=(ck.m, ck.n)),
-            "y": TritonWarmupTensor(ck.y_dtype, shape=(ck.m, ck.n)),
-            "eps": ck.eps,
-            "M": ck.m,
-            "N": ck.n,
-            "BD": ck.bd,
-            "MBLOCK": ck.mblock,
-        }
-
-    @kernel_launcher
-    def __call__(self, x, y, eps, M, N, BD, MBLOCK) -> LaunchSpec:
-        grid = (triton.cdiv(M, MBLOCK),)
-        return grid, dict(X=x, Y=y, eps=eps, M=M, N=N, BD=BD, MBLOCK=MBLOCK)
+@l2norm_fwd_kernel2.launcher
+def _L2NORM_FWD_KERNEL2(x, y, eps, M, N, BD, MBLOCK) -> LaunchSpec:
+    grid = (triton.cdiv(M, MBLOCK),)
+    return grid, dict(X=x, Y=y, eps=eps, M=M, N=N, BD=BD, MBLOCK=MBLOCK)
 
 
 def l2norm_fwd(
@@ -291,7 +207,3 @@ def l2norm_fwd(
             )
 
     return y.view(x_shape_og)
-
-
-_L2NORM_FWD_KERNEL = FlaL2NormFwdKernel()
-_L2NORM_FWD_KERNEL2 = FlaL2NormFwdKernel2()

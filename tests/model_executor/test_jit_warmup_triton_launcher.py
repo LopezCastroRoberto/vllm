@@ -4,10 +4,15 @@
 from dataclasses import dataclass
 from typing import Any
 
+from vllm.model_executor.warmup.jit_warmup import WarmupIntRange
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     LaunchSpec,
+    TritonWarmupParam,
+    TritonWarmupTensor,
+    TritonWarmupTensorSpec,
     VllmTritonJitKernel,
     kernel_launcher,
+    simple_triton_jit_kernel,
 )
 
 
@@ -89,6 +94,36 @@ def test_triton_launcher_supports_cpu_function_wrappers() -> None:
 
     owner("runtime", 2, None)
     assert calls == [("runtime", 2, 7)]
+
+
+def test_simple_triton_kernel_builds_declarative_warmup_inputs() -> None:
+    kernel = _FakeTritonKernel()
+
+    owner = simple_triton_jit_kernel(
+        warmup_inputs={
+            "first": TritonWarmupTensorSpec("dtype", ("size",)),
+            "second": TritonWarmupParam("value"),
+        }
+    )(kernel)
+
+    @owner.launcher
+    def launch(first: Any, second: int) -> LaunchSpec:
+        return (2,), {"CONST": 7}
+
+    keys = owner.get_warmup_keys(dtype="float32", size=4, value=WarmupIntRange(1, 4))
+    assert len(keys) == 3
+
+    for key in keys:
+        owner.compile(key)
+    assert kernel.warmup_calls == [
+        {
+            "grid": (1,),
+            "first": TritonWarmupTensor("float32", shape=(4,)),
+            "second": value,
+            "CONST": 7,
+        }
+        for value in (1, 2, 3)
+    ]
 
 
 def test_compute_slot_mapping_uses_named_launcher_inputs(monkeypatch) -> None:
