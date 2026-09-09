@@ -9,9 +9,6 @@
 # ruff: noqa: E501
 
 
-from dataclasses import dataclass
-from typing import Any
-
 import torch
 import torch.nn as nn
 
@@ -19,8 +16,7 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     LaunchSpec,
     TritonWarmupTensor,
-    VllmTritonJitKernel,
-    kernel_launcher,
+    simple_triton_jit_kernel,
     triton_scalar_specialization_rep,
 )
 from vllm.triton_utils import tl, triton
@@ -155,6 +151,63 @@ def fused_recurrent_kda(
     return o, final_state
 
 
+def _layer_norm_gated_warmup_inputs(
+    *,
+    x_dtype: torch.dtype,
+    y_dtype: torch.dtype,
+    g_dtype: torch.dtype,
+    w_dtype: torch.dtype,
+    eps: float,
+    num_heads: int,
+    g_stride_n: int,
+    d: int,
+    block_d: int,
+    activation: str,
+    is_rms_norm: bool,
+    block_t: int = 16,
+    store_residual_out: bool = False,
+    has_residual: bool = False,
+    has_weight: bool = True,
+    has_bias: bool = False,
+) -> tuple[dict[str, object], ...]:
+    def inputs(t: int) -> dict[str, object]:
+        return {
+            "x": TritonWarmupTensor(x_dtype, shape=(t, d)),
+            "g": TritonWarmupTensor(g_dtype, shape=(t, num_heads, d)),
+            "y": TritonWarmupTensor(y_dtype, shape=(t, d)),
+            "weight": TritonWarmupTensor(w_dtype, shape=(d,)) if has_weight else None,
+            "bias": TritonWarmupTensor(w_dtype, shape=(d,)) if has_bias else None,
+            "residual": (
+                TritonWarmupTensor(x_dtype, shape=(t, d)) if has_residual else None
+            ),
+            "residual_out": (
+                TritonWarmupTensor(x_dtype, shape=(t, d))
+                if store_residual_out
+                else None
+            ),
+            "mean": (
+                None
+                if is_rms_norm
+                else TritonWarmupTensor(torch.float32, shape=(t,))
+            ),
+            "rstd": TritonWarmupTensor(torch.float32, shape=(t,)),
+            "eps": eps,
+            "T": t,
+            "H": num_heads,
+            "g_stride_n": g_stride_n,
+            "D": d,
+            "BD": block_d,
+            "BT": block_t,
+            "activation": activation,
+            "is_rms_norm": is_rms_norm,
+        }
+
+    return tuple(
+        inputs(triton_scalar_specialization_rep(t)) for t in (1, 2, 16)
+    )
+
+
+@simple_triton_jit_kernel(warmup_inputs=_layer_norm_gated_warmup_inputs)
 @triton.heuristics(
     {
         "STORE_RESIDUAL_OUT": lambda args: args["residual_out"] is not None,
@@ -326,202 +379,18 @@ def layer_norm_gated_fwd_kernel1(
     tl.store(y + o_d, b_y, mask=m_d)
 
 
-class FlaLayerNormGatedFwdKernel(
-    VllmTritonJitKernel["FlaLayerNormGatedFwdKernel.CompileKey"]
-):
-    """JIT owner for the D<=512 gated (RMS) layer-norm output kernel."""
-
-    kernel = staticmethod(layer_norm_gated_fwd_kernel)
-
-    @dataclass(frozen=True)
-    class CompileKey:
-        x_dtype: torch.dtype
-        y_dtype: torch.dtype
-        g_dtype: torch.dtype
-        w_dtype: torch.dtype
-        eps: float
-        t: int
-        num_heads: int
-        g_stride_n: int
-        d: int
-        block_t: int
-        block_d: int
-        activation: str
-        is_rms_norm: bool
-        store_residual_out: bool
-        has_residual: bool
-        has_weight: bool
-        has_bias: bool
-
-    def dispatch(  # type: ignore[override]
-        self,
-        *,
-        x_dtype: torch.dtype,
-        y_dtype: torch.dtype,
-        g_dtype: torch.dtype,
-        w_dtype: torch.dtype,
-        eps: float,
-        t: int,
-        num_heads: int,
-        g_stride_n: int,
-        d: int,
-        block_d: int,
-        activation: str,
-        is_rms_norm: bool,
-        block_t: int = 16,
-        store_residual_out: bool = False,
-        has_residual: bool = False,
-        has_weight: bool = True,
-        has_bias: bool = False,
-    ) -> CompileKey:
-        return self.CompileKey(
-            x_dtype=x_dtype,
-            y_dtype=y_dtype,
-            g_dtype=g_dtype,
-            w_dtype=w_dtype,
-            eps=eps,
-            t=triton_scalar_specialization_rep(t),
-            num_heads=num_heads,
-            g_stride_n=g_stride_n,
-            d=d,
-            block_t=block_t,
-            block_d=block_d,
-            activation=activation,
-            is_rms_norm=is_rms_norm,
-            store_residual_out=store_residual_out,
-            has_residual=has_residual,
-            has_weight=has_weight,
-            has_bias=has_bias,
-        )
-
-    def get_warmup_keys(  # type: ignore[override]
-        self,
-        *,
-        x_dtype: torch.dtype,
-        y_dtype: torch.dtype,
-        g_dtype: torch.dtype,
-        w_dtype: torch.dtype,
-        eps: float,
-        num_heads: int,
-        g_stride_n: int,
-        d: int,
-        block_d: int,
-        activation: str,
-        is_rms_norm: bool,
-        block_t: int = 16,
-        store_residual_out: bool = False,
-        has_residual: bool = False,
-        has_weight: bool = True,
-        has_bias: bool = False,
-    ) -> list[CompileKey]:
-        return self._trace_dispatch(self.dispatch)(
-            x_dtype=x_dtype,
-            y_dtype=y_dtype,
-            g_dtype=g_dtype,
-            w_dtype=w_dtype,
-            eps=eps,
-            t=(1, 2, 16),
-            num_heads=num_heads,
-            g_stride_n=g_stride_n,
-            d=d,
-            block_t=block_t,
-            block_d=block_d,
-            activation=activation,
-            is_rms_norm=is_rms_norm,
-            store_residual_out=store_residual_out,
-            has_residual=has_residual,
-            has_weight=has_weight,
-            has_bias=has_bias,
-        )
-
-    def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
-        ck = compile_key
-        t, d, h = ck.t, ck.d, ck.num_heads
-        return {
-            "x": TritonWarmupTensor(ck.x_dtype, shape=(t, d)),
-            "g": TritonWarmupTensor(ck.g_dtype, shape=(t, h, d)),
-            "y": TritonWarmupTensor(ck.y_dtype, shape=(t, d)),
-            "weight": (
-                TritonWarmupTensor(ck.w_dtype, shape=(d,))
-                if ck.has_weight
-                else None
-            ),
-            "bias": (
-                TritonWarmupTensor(ck.w_dtype, shape=(d,))
-                if ck.has_bias
-                else None
-            ),
-            "residual": (
-                TritonWarmupTensor(ck.x_dtype, shape=(t, d))
-                if ck.has_residual
-                else None
-            ),
-            "residual_out": (
-                TritonWarmupTensor(ck.x_dtype, shape=(t, d))
-                if ck.store_residual_out
-                else None
-            ),
-            "mean": (
-                None
-                if ck.is_rms_norm
-                else TritonWarmupTensor(torch.float32, shape=(t,))
-            ),
-            "rstd": TritonWarmupTensor(torch.float32, shape=(t,)),
-            "eps": ck.eps,
-            "T": t,
-            "H": h,
-            "g_stride_n": ck.g_stride_n,
-            "D": d,
-            "BD": ck.block_d,
-            "BT": ck.block_t,
-            "activation": ck.activation,
-            "is_rms_norm": ck.is_rms_norm,
-        }
-
-    @kernel_launcher
-    def __call__(
-        self,
-        x,
-        g,
-        y,
-        weight,
-        bias,
-        residual,
-        residual_out,
-        mean,
-        rstd,
-        eps,
-        T,
-        H,
-        g_stride_n,
-        D,
-        BD,
-        BT,
-        activation,
-        is_rms_norm,
-    ) -> LaunchSpec:
-        grid = (triton.cdiv(T, BT),)
-        return grid, dict(
-            x=x,
-            g=g,
-            y=y,
-            w=weight,
-            b=bias,
-            residual=residual,
-            residual_out=residual_out,
-            mean=mean,
-            rstd=rstd,
-            eps=eps,
-            T=T,
-            H=H,
-            g_stride_n=g_stride_n,
-            D=D,
-            BD=BD,
-            BT=BT,
-            ACTIVATION=activation,
-            IS_RMS_NORM=is_rms_norm,
-            num_warps=8,
-        )
+@layer_norm_gated_fwd_kernel.launcher
+def _LAYER_NORM_GATED_FWD_KERNEL(
+    x, g, y, weight, bias, residual, residual_out, mean, rstd, eps,
+    T, H, g_stride_n, D, BD, BT, activation, is_rms_norm,
+) -> LaunchSpec:
+    grid = (triton.cdiv(T, BT),)
+    return grid, dict(
+        x=x, g=g, y=y, w=weight, b=bias, residual=residual,
+        residual_out=residual_out, mean=mean, rstd=rstd, eps=eps,
+        T=T, H=H, g_stride_n=g_stride_n, D=D, BD=BD, BT=BT,
+        ACTIVATION=activation, IS_RMS_NORM=is_rms_norm, num_warps=8,
+    )
 
 
 def layer_norm_gated_fwd(
@@ -1890,6 +1759,3 @@ def fused_kda_gate(
 
     y = y.view(*orig_shape, H, head_k_dim)
     return y
-
-
-_LAYER_NORM_GATED_FWD_KERNEL = FlaLayerNormGatedFwdKernel()

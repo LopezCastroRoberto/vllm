@@ -1,20 +1,42 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
-
 import torch
+
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     LaunchSpec,
     TritonWarmupTensor,
-    VllmTritonJitKernel,
-    kernel_launcher,
+    simple_triton_jit_kernel,
     triton_scalar_specialization_rep,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
+def _scatter_states_warmup_inputs(
+    *, row_size: int, dtype: torch.dtype, indices_dtype: torch.dtype
+) -> tuple[dict[str, object], ...]:
+    stride = triton_scalar_specialization_rep(row_size)
+    inputs = {
+        "state": TritonWarmupTensor(
+            dtype,
+            shape=(2, row_size),
+            strides=(stride, 1),
+        ),
+        "src": TritonWarmupTensor(
+            dtype,
+            shape=(1, row_size),
+            strides=(stride, 1),
+        ),
+        "indices": TritonWarmupTensor(
+            indices_dtype,
+            strides=(1,),
+        ),
+    }
+    return tuple({**inputs, "launch_pdl": launch_pdl} for launch_pdl in (False, True))
+
+
+@simple_triton_jit_kernel(warmup_inputs=_scatter_states_warmup_inputs)
 @triton.jit
 def _scatter_states_kernel(
     state_ptr,
@@ -41,121 +63,37 @@ def _scatter_states_kernel(
     tl.store(state_ptr + state_idx * stride_state_batch + offsets, values, mask=mask)
 
 
-class ScatterStatesKernel(VllmTritonJitKernel["ScatterStatesKernel.CompileKey"]):
-    kernel = staticmethod(_scatter_states_kernel)
-
-    @dataclass(frozen=True)
-    class CompileKey:
-        row_size: int
-        block_size: int
-        dtype: torch.dtype
-        indices_dtype: torch.dtype
-        stride_state_batch: int
-        stride_src_batch: int
-        stride_indices: int
-        launch_pdl: bool
-
-    def dispatch(
-        self,
-        *,
-        row_size: int,
-        dtype: torch.dtype,
-        indices_dtype: torch.dtype,
-        stride_state_batch: int,
-        stride_src_batch: int,
-        stride_indices: int,
-        launch_pdl: bool,
-    ) -> CompileKey:
-        return self.CompileKey(
-            row_size=row_size,
-            block_size=min(triton.next_power_of_2(row_size), 1024),
-            dtype=dtype,
-            indices_dtype=indices_dtype,
-            stride_state_batch=triton_scalar_specialization_rep(stride_state_batch),
-            stride_src_batch=triton_scalar_specialization_rep(stride_src_batch),
-            stride_indices=triton_scalar_specialization_rep(stride_indices),
-            launch_pdl=launch_pdl,
-        )
-
-    def get_warmup_keys(
-        self,
-        *,
-        row_size: int,
-        dtype: torch.dtype,
-        indices_dtype: torch.dtype,
-    ) -> list[CompileKey]:
-        return self._trace_dispatch(self.dispatch)(
-            row_size=row_size,
-            dtype=dtype,
-            indices_dtype=indices_dtype,
-            stride_state_batch=row_size,
-            stride_src_batch=row_size,
-            stride_indices=1,
-            launch_pdl=(False, True),
-        )
-
-    def warmup_inputs(self, compile_key: CompileKey) -> dict[str, object]:
-        return {
-            "state": TritonWarmupTensor(
-                compile_key.dtype,
-                shape=(2, compile_key.row_size),
-                strides=(compile_key.stride_state_batch, 1),
-            ),
-            "src": TritonWarmupTensor(
-                compile_key.dtype,
-                shape=(1, compile_key.row_size),
-                strides=(compile_key.stride_src_batch, 1),
-            ),
-            "indices": TritonWarmupTensor(
-                compile_key.indices_dtype,
-                strides=(compile_key.stride_indices,),
-            ),
-        }
-
-    @kernel_launcher
-    def __call__(
-        self,
-        state: torch.Tensor,
-        src: torch.Tensor,
-        indices: torch.Tensor,
-    ) -> LaunchSpec:
-        row_size = state[0].numel()
-        block_size = min(triton.next_power_of_2(row_size), 1024)
-        grid = (triton.cdiv(row_size, block_size), indices.numel())
-        return grid, {
-            "stride_state_batch": state.stride(0),
-            "stride_src_batch": src.stride(0),
-            "stride_indices": indices.stride(0),
-            "row_size": row_size,
-            "BLOCK_SIZE": block_size,
-            "num_warps": 8,
-            "launch_pdl": current_platform.is_arch_support_pdl(),
-        }
-
-
+@_scatter_states_kernel.launcher
 def scatter_states(
     state: torch.Tensor,
     src: torch.Tensor,
     indices: torch.Tensor,
-) -> None:
-    """Scatter ``src`` rows into ``state`` at ``indices`` (in place).
+    launch_pdl: bool | None = None,
+) -> LaunchSpec:
+    """Scatter ``src`` rows into ``state`` at ``indices`` (in place)."""
+    if isinstance(state, torch.Tensor):
+        assert state.ndim >= 2
+        assert state.is_cuda
+        assert src.ndim == state.ndim
+        assert indices.ndim == 1
+        assert indices.device == state.device
+        assert src.shape[1:] == state.shape[1:]
+        assert src.shape[0] == indices.shape[0]
+        assert indices.dtype in (torch.int32, torch.int64)
+        assert state[0].is_contiguous()
+        assert src[0].is_contiguous()
 
-    Equivalent to ``state[indices] = src`` but non-atomic and bandwidth-bound,
-    since mamba cache slots are unique per sequence. ``gather_initial_states``
-    is the read-side counterpart.
-    """
-    assert state.ndim >= 2
-    assert state.is_cuda
-    assert src.ndim == state.ndim
-    assert indices.ndim == 1
-    assert indices.device == state.device
-    assert src.shape[1:] == state.shape[1:]
-    assert src.shape[0] == indices.shape[0]
-    assert indices.dtype in (torch.int32, torch.int64)
-
-    assert state[0].is_contiguous()
-    assert src[0].is_contiguous()
-    _SCATTER_STATES_KERNEL(state, src, indices)
-
-
-_SCATTER_STATES_KERNEL = ScatterStatesKernel()
+    row_size = state.shape[1]
+    block_size = min(triton.next_power_of_2(row_size), 1024)
+    grid = (triton.cdiv(row_size, block_size), indices.shape[0])
+    return grid, {
+        "stride_state_batch": state.stride(0),
+        "stride_src_batch": src.stride(0),
+        "stride_indices": indices.stride(0),
+        "row_size": row_size,
+        "BLOCK_SIZE": block_size,
+        "num_warps": 8,
+        "launch_pdl": (
+            current_platform.is_arch_support_pdl() if launch_pdl is None else launch_pdl
+        ),
+    }

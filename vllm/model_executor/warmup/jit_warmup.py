@@ -21,6 +21,7 @@ __all__ = [
     "JitWarmupRegistry",
     "VllmJitKernel",
     "WarmupIntRange",
+    "expand_warmup_inputs",
     "get_ast_full_name",
     "get_function_source_node",
     "zip_inputs",
@@ -545,16 +546,78 @@ def _trace_warmup_predicate(
     )
 
 
+def _expand_warmup_dispatch_values(
+    input_groups: tuple[_WarmupInputRows, ...],
+    kwargs: Mapping[str, WarmupValues],
+    input_names: frozenset[str],
+    predicate_trace: _WarmupPredicateTrace | None,
+) -> tuple[dict[str, Any], ...]:
+    for group in input_groups:
+        if not isinstance(group, _WarmupInputRows):
+            raise TypeError("warmup input groups must come from zip_inputs(...)")
+    expanded_input_groups = tuple(
+        _expand_warmup_input_rows(group.rows, input_names) for group in input_groups
+    )
+    expanded_kwarg_axes = tuple(
+        (name, _expand_warmup_values(value))
+        for name, value in kwargs.items()
+        if name in input_names
+    )
+    dispatch_value_axes = (
+        *expanded_input_groups,
+        *(values for _, values in expanded_kwarg_axes),
+    )
+    input_group_count = len(expanded_input_groups)
+    kwarg_names = tuple(name for name, _ in expanded_kwarg_axes)
+    values: list[dict[str, Any]] = []
+    for dispatch_value_set in itertools.product(*dispatch_value_axes):
+        dispatch_values = _merge_warmup_kwargs(
+            (
+                *dispatch_value_set[:input_group_count],
+                dict(zip(kwarg_names, dispatch_value_set[input_group_count:])),
+            )
+        )
+        if predicate_trace is None or predicate_trace.matches(dispatch_values):
+            values.append(dispatch_values)
+    return tuple(values)
+
+
+def expand_warmup_inputs(
+    *input_groups: _WarmupInputRows,
+    _when: WarmupPredicateFn | None = None,
+    **kwargs: WarmupValues,
+) -> tuple[dict[str, Any], ...]:
+    """Expand ranges, independent products, and zipped warmup input groups."""
+    for group in input_groups:
+        if not isinstance(group, _WarmupInputRows):
+            raise TypeError(
+                "expand_warmup_inputs positional arguments must be zip_inputs(...)"
+            )
+    predicate_trace = _trace_warmup_predicate(_when) if _when is not None else None
+    input_names = frozenset(kwargs).union(*(group.rows[0] for group in input_groups))
+    if predicate_trace is not None:
+        input_names = input_names | predicate_trace.input_names
+    return _expand_warmup_dispatch_values(
+        input_groups, kwargs, input_names, predicate_trace
+    )
+
+
 class VllmJitKernel(Generic[CompileKeyT], ABC):
     """Kernel wrapper that owns dispatch, warmup keys, and compilation."""
 
     CompileKey: type[CompileKeyT]
 
     def __init__(self) -> None:
-        self._dispatch_trace = _trace_compile_key_dispatch(self.dispatch)
+        self._dispatch_trace = (
+            None
+            if type(self).dispatch is VllmJitKernel.dispatch
+            else _trace_compile_key_dispatch(self.dispatch)
+        )
         self._compiled_cache: dict[Any, Any] = {}
 
     def compile_key(self, kwargs: Mapping[str, Any]) -> CompileKeyT:
+        if self._dispatch_trace is None:
+            raise NotImplementedError(f"{type(self).__name__} has no traced dispatch")
         return self._dispatch_trace.compile_key(self.CompileKey, kwargs)
 
     def _get_or_compile(
@@ -604,39 +667,10 @@ class VllmJitKernel(Generic[CompileKeyT], ABC):
             input_names = compile_key_dispatch_trace.input_names_for(available_names)
             if predicate_trace is not None:
                 input_names = input_names | predicate_trace.input_names
-            expanded_input_groups = tuple(
-                _expand_warmup_input_rows(group.rows, input_names)
-                for group in input_groups
-            )
-            # Expand independent keyword inputs into cartesian-product axes.
-            expanded_kwarg_axes = tuple(
-                (name, _expand_warmup_values(value))
-                for name, value in kwargs.items()
-                if name in input_names
-            )
-            dispatch_value_axes = (
-                *expanded_input_groups,
-                *(values for _, values in expanded_kwarg_axes),
-            )
-            input_group_count = len(expanded_input_groups)
-            kwarg_names = tuple(name for name, _ in expanded_kwarg_axes)
             compile_keys: dict[CompileKeyT, None] = {}
-            for dispatch_value_set in itertools.product(*dispatch_value_axes):
-                dispatch_values = _merge_warmup_kwargs(
-                    (
-                        *dispatch_value_set[:input_group_count],
-                        dict(
-                            zip(
-                                kwarg_names,
-                                dispatch_value_set[input_group_count:],
-                            )
-                        ),
-                    )
-                )
-                if predicate_trace is not None and not predicate_trace.matches(
-                    dispatch_values
-                ):
-                    continue
+            for dispatch_values in _expand_warmup_dispatch_values(
+                input_groups, kwargs, input_names, predicate_trace
+            ):
                 compile_key = compile_key_dispatch_trace.compile_key(
                     self.CompileKey, dispatch_values
                 )
@@ -645,7 +679,6 @@ class VllmJitKernel(Generic[CompileKeyT], ABC):
 
         return traced
 
-    @abstractmethod
     def dispatch(self, **kwargs: Any) -> CompileKeyT:
         """Build one compile key from one concrete dispatch point."""
         raise NotImplementedError

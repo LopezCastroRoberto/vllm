@@ -4,6 +4,7 @@
 
 import torch
 from torch import nn
+
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide
@@ -29,10 +30,7 @@ from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     GATHER_INITIAL_STATES_KERNEL,
     gather_initial_states,
 )
-from vllm.model_executor.layers.mamba.ops.scatter_states import (
-    _SCATTER_STATES_KERNEL,
-    scatter_states,
-)
+from vllm.model_executor.layers.mamba.ops.scatter_states import scatter_states
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import (
     maybe_disable_graph_partition,
@@ -67,7 +65,7 @@ if current_platform.is_rocm():
         fused_recurrent_kda,
     )
 else:
-    from vllm.models.glm5next.nvidia.ops.third_party.kda import (
+    from vllm.models.glm5next.nvidia.ops.third_party.kda import (  # type: ignore[assignment]
         _CHUNK_GLA_FWD_O_KERNEL,
         _FUSED_RECURRENT_GATED_DELTA_RULE_FWD_KERNEL,
         _KDA_GATE_CUMSUM_KERNEL,
@@ -330,6 +328,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 launch_pdl=current_platform.is_arch_support_pdl(),
             )
             io_dtype = vllm_config.model_config.dtype
+            assert isinstance(io_dtype, torch.dtype)
             state_dtype = self.get_state_dtype()[1]
             _KDA_GATE_CUMSUM_KERNEL.register_warmup(
                 g_dtype=io_dtype,
@@ -354,8 +353,6 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 num_heads=self.local_num_heads,
                 head_dim=self.head_dim,
                 block_t=64,
-                block_c=16,
-                num_chunks=4,
                 is_varlen=True,
             )
             _KDA_INTRA_CHUNK_KERNEL.register_warmup(
@@ -368,8 +365,6 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 num_heads=self.local_num_heads,
                 head_dim=self.head_dim,
                 block_t=64,
-                block_c=16,
-                block_k=next_power_of_2(self.head_dim),
                 is_varlen=True,
             )
             _RECOMPUTE_WU_KERNEL.register_warmup(
@@ -468,15 +463,15 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 max_query_len=max(1, self.num_spec + 1),
                 lower_bound=self.kda_lower_bound,
             )
-            _SCATTER_STATES_KERNEL.register_warmup(
+            scatter_states.register_warmup(
                 row_size=self.local_num_heads * self.head_dim * self.head_dim,
                 dtype=self.get_state_dtype()[1],
                 indices_dtype=torch.int32,
             )
             _LAYER_NORM_GATED_FWD_KERNEL.register_warmup(
-                x_dtype=vllm_config.model_config.dtype,
-                y_dtype=vllm_config.model_config.dtype,
-                g_dtype=vllm_config.model_config.dtype,
+                x_dtype=io_dtype,
+                y_dtype=io_dtype,
+                g_dtype=io_dtype,
                 w_dtype=self.o_norm.weight.dtype,
                 eps=self.o_norm.eps,
                 num_heads=self.local_num_heads,
@@ -484,7 +479,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 d=self.head_dim,
                 block_t=16,
                 block_d=min(
-                    65536 // vllm_config.model_config.dtype.itemsize,
+                    65536 // io_dtype.itemsize,
                     next_power_of_2(self.head_dim),
                 ),
                 activation=self.o_norm.activation,
