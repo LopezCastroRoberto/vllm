@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
 
 import torch
 
-from vllm.model_executor.warmup.jit_warmup import kernel_launcher
+from vllm.model_executor.warmup.jit_warmup import WarmupChoices
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    DeclarativeTritonJitKernel,
     LaunchSpec,
     TritonWarmupTensor,
-    VllmTritonJitKernel,
+    compile_key,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -423,40 +423,13 @@ def _fused_norm_rope_kernel(
             )
 
 
-class FusedNormRopeKernel(VllmTritonJitKernel["FusedNormRopeKernel.CompileKey"]):
+class FusedNormRopeKernel(DeclarativeTritonJitKernel):
     """Warmup owner for fused Q/KV norm, RoPE, and cache insertion."""
 
     kernel = staticmethod(_fused_norm_rope_kernel)
     topk_block_size = 1024
 
-    @dataclass(frozen=True)
-    class CompileKey:
-        q_dim: int
-        q_block_size: int
-        kv_dim: int
-        kpe_half_rot_dim: int
-        index_k_dim: int
-        index_k_block_size: int
-        index_k_half_rot_dim: int
-        mla_cache_fp8: bool
-        mla_cache_ds_mla: bool
-        mla_num_tiles: int
-        mla_tile_dim: int
-        topk: int
-        has_indexer: bool
-        index_rope_interleave: bool
-        use_pdl: bool
-        slot_mapping_present: bool
-        kv_out_present: bool
-        kpe_out_present: bool
-        index_k_out_present: bool
-        indexer_cache_present: bool
-        block_size: int
-        act_dtype: torch.dtype
-        cos_sin_dtype: torch.dtype
-        topk_dtype: torch.dtype
-
-    def dispatch(  # type: ignore[override]
+    def warmup_cases(
         self,
         *,
         q_lora_rank: int,
@@ -473,97 +446,47 @@ class FusedNormRopeKernel(VllmTritonJitKernel["FusedNormRopeKernel.CompileKey"])
         act_dtype: torch.dtype,
         cos_sin_dtype: torch.dtype,
         topk_dtype: torch.dtype,
-        has_cache: bool,
-    ) -> "FusedNormRopeKernel.CompileKey":
+    ) -> tuple[dict[str, Any], ...]:
         half_rot = qk_rope_head_dim // 2
-        mla_present = has_cache and not use_pcp
         ds_mla = mla_kv_cache_dtype == "fp8_ds_mla"
-        mla_fp8 = is_quantized_kv_cache(mla_kv_cache_dtype) and not ds_mla
-        mla_num_tiles = kv_lora_rank // 128 if (mla_present and ds_mla) else 1
-        mla_tile_dim = kv_lora_rank // mla_num_tiles if ds_mla else 1
-        return self.CompileKey(
-            q_dim=q_lora_rank,
-            q_block_size=triton.next_power_of_2(q_lora_rank),
-            kv_dim=kv_lora_rank,
-            kpe_half_rot_dim=half_rot,
-            index_k_dim=index_head_dim if has_indexer else 1,
-            index_k_block_size=triton.next_power_of_2(index_head_dim)
-            if has_indexer
-            else 1,
-            index_k_half_rot_dim=half_rot,
-            mla_cache_fp8=mla_fp8,
-            mla_cache_ds_mla=ds_mla,
-            mla_num_tiles=mla_num_tiles,
-            mla_tile_dim=mla_tile_dim,
-            topk=topk,
-            has_indexer=has_indexer,
-            index_rope_interleave=index_rope_interleave,
-            use_pdl=use_pdl,
-            slot_mapping_present=mla_present,
-            kv_out_present=use_pcp,
-            kpe_out_present=use_pcp,
-            index_k_out_present=has_indexer and use_pcp,
-            indexer_cache_present=has_indexer and mla_present,
-            block_size=block_size,
-            act_dtype=act_dtype,
-            cos_sin_dtype=cos_sin_dtype,
-            topk_dtype=topk_dtype,
-        )
-
-    def get_warmup_keys(  # type: ignore[override]
-        self,
-        *,
-        q_lora_rank: int,
-        kv_lora_rank: int,
-        qk_rope_head_dim: int,
-        index_head_dim: int,
-        topk: int,
-        use_pcp: bool,
-        has_indexer: bool,
-        index_rope_interleave: bool,
-        use_pdl: bool,
-        mla_kv_cache_dtype: str,
-        block_size: int,
-        act_dtype: torch.dtype,
-        cos_sin_dtype: torch.dtype,
-        topk_dtype: torch.dtype,
-    ) -> "list[FusedNormRopeKernel.CompileKey]":
-        return self._trace_dispatch(self.dispatch)(
-            q_lora_rank=q_lora_rank,
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            index_head_dim=index_head_dim,
-            topk=topk,
-            use_pcp=use_pcp,
-            has_indexer=has_indexer,
-            index_rope_interleave=index_rope_interleave,
-            use_pdl=use_pdl,
-            mla_kv_cache_dtype=mla_kv_cache_dtype,
-            block_size=block_size,
-            act_dtype=act_dtype,
-            cos_sin_dtype=cos_sin_dtype,
-            topk_dtype=topk_dtype,
-            has_cache=(True, False),
-        )
-
-    def warmup_inputs(
-        self, compile_key: "FusedNormRopeKernel.CompileKey"
-    ) -> dict[str, Any]:
-        k = compile_key
-        qk_rope = 2 * k.kpe_half_rot_dim
-        index_shape = (1, k.index_k_dim)
-        activation = TritonWarmupTensor(k.act_dtype)
-        q = TritonWarmupTensor(k.act_dtype, shape=(1, k.q_dim))
-        kv = TritonWarmupTensor(k.act_dtype, shape=(1, k.kv_dim))
-        kpe = TritonWarmupTensor(k.act_dtype, shape=(1, qk_rope))
-        index_k = TritonWarmupTensor(k.act_dtype, shape=index_shape)
-        cos_sin = TritonWarmupTensor(k.cos_sin_dtype, shape=(1, qk_rope))
+        mla_fp8 = is_quantized_kv_cache(mla_kv_cache_dtype) and (not ds_mla)
+        qk_rope = 2 * half_rot
+        index_k_dim = index_head_dim if has_indexer else 1
+        index_shape = (1, index_k_dim)
+        activation = TritonWarmupTensor(act_dtype)
+        q = TritonWarmupTensor(act_dtype, shape=(1, q_lora_rank))
+        kv = TritonWarmupTensor(act_dtype, shape=(1, kv_lora_rank))
+        kpe = TritonWarmupTensor(act_dtype, shape=(1, qk_rope))
+        index_k = TritonWarmupTensor(act_dtype, shape=index_shape)
+        cos_sin = TritonWarmupTensor(cos_sin_dtype, shape=(1, qk_rope))
         fp32 = TritonWarmupTensor(torch.float32)
-        mla_fp8_view = k.slot_mapping_present and (
-            k.mla_cache_ds_mla or k.mla_cache_fp8
-        )
-        idx_cache_entry = k.index_k_dim + k.index_k_dim // 128 * 4
+        idx_cache_entry = index_k_dim + index_k_dim // 128 * 4
+        has_cache = WarmupChoices(True, False)
+        mla_present = has_cache and (not use_pcp)
+        indexer_cache_present = has_indexer and mla_present
+        mla_fp8_view = mla_present and (ds_mla or mla_fp8)
+        mla_num_tiles = kv_lora_rank // 128 if mla_present and ds_mla else 1
+        mla_tile_dim = kv_lora_rank // mla_num_tiles if ds_mla else 1
         return dict(
+            q_dim=compile_key(q_lora_rank),
+            q_block_size=compile_key(triton.next_power_of_2(q_lora_rank)),
+            kv_dim=compile_key(kv_lora_rank),
+            kpe_half_rot_dim=compile_key(half_rot),
+            index_k_dim=compile_key(index_k_dim),
+            index_k_block_size=compile_key(
+                triton.next_power_of_2(index_head_dim) if has_indexer else 1
+            ),
+            index_k_half_rot_dim=compile_key(half_rot),
+            topk=compile_key(topk),
+            slot_mapping_present=compile_key(mla_present),
+            kv_out_present=compile_key(use_pcp),
+            kpe_out_present=compile_key(use_pcp),
+            index_k_out_present=compile_key(has_indexer and use_pcp),
+            indexer_cache_present=compile_key(has_indexer and mla_present),
+            block_size=compile_key(block_size),
+            act_dtype=compile_key(act_dtype),
+            cos_sin_dtype=compile_key(cos_sin_dtype),
+            topk_dtype=compile_key(topk_dtype),
             positions=TritonWarmupTensor(torch.int64),
             q_c=q,
             q_rms_norm_w=activation,
@@ -572,51 +495,43 @@ class FusedNormRopeKernel(VllmTritonJitKernel["FusedNormRopeKernel.CompileKey"])
             kv_c=kv,
             kv_rms_norm_w=activation,
             kv_rms_eps=0.0,
-            kv_c_out=kv if k.kv_out_present else None,
+            kv_c_out=kv if use_pcp else None,
             k_pe=kpe,
             k_rope_cos_sin_cache=cos_sin,
-            k_pe_out=kpe if k.kpe_out_present else None,
+            k_pe_out=kpe if use_pcp else None,
             index_k=index_k,
             index_k_layer_norm_w=fp32,
             index_k_layer_norm_bias=fp32,
             index_k_layer_norm_eps=0.0,
             index_k_rope_cos_sin_cache=cos_sin,
-            index_k_out=index_k if k.index_k_out_present else None,
-            slot_mapping=(
-                TritonWarmupTensor(torch.int64) if k.slot_mapping_present else None
-            ),
-            indexer_k_cache=(
-                TritonWarmupTensor(torch.float8_e4m3fn)
-                if k.indexer_cache_present
-                else None
-            ),
-            idx_cache_scale_view=fp32 if k.indexer_cache_present else None,
-            idx_cache_block_size=k.block_size if k.indexer_cache_present else 1,
-            idx_cache_stride=idx_cache_entry if k.indexer_cache_present else 0,
+            index_k_out=index_k if has_indexer and use_pcp else None,
+            slot_mapping=TritonWarmupTensor(torch.int64) if mla_present else None,
+            indexer_k_cache=TritonWarmupTensor(torch.float8_e4m3fn)
+            if indexer_cache_present
+            else None,
+            idx_cache_scale_view=fp32 if indexer_cache_present else None,
+            idx_cache_block_size=block_size if indexer_cache_present else 1,
+            idx_cache_stride=idx_cache_entry if indexer_cache_present else 0,
             mla_kv_cache=TritonWarmupTensor(
                 torch.float8_e4m3fn if mla_fp8_view else torch.bfloat16
             ),
-            mla_block_stride=k.kv_dim if k.slot_mapping_present else 0,
-            mla_entry_stride=k.kv_dim if k.slot_mapping_present else 0,
-            mla_block_size=k.block_size,
-            mla_cache_fp8=k.mla_cache_fp8,
+            mla_block_stride=kv_lora_rank if mla_present else 0,
+            mla_entry_stride=kv_lora_rank if mla_present else 0,
+            mla_block_size=block_size,
+            mla_cache_fp8=compile_key(mla_fp8),
             mla_k_scale=fp32,
             mla_ds_scale_view=fp32,
             mla_ds_rope_view=TritonWarmupTensor(torch.bfloat16),
-            mla_cache_ds_mla=k.mla_cache_ds_mla,
-            mla_num_tiles=k.mla_num_tiles,
-            mla_tile_dim=k.mla_tile_dim,
-            topk_indices_buffer=TritonWarmupTensor(
-                k.topk_dtype,
-                shape=(1, k.topk),
-            ),
-            has_indexer=k.has_indexer,
-            index_rope_interleave=k.index_rope_interleave,
-            use_pdl=k.use_pdl,
+            mla_cache_ds_mla=compile_key(ds_mla),
+            mla_num_tiles=compile_key(mla_num_tiles),
+            mla_tile_dim=compile_key(mla_tile_dim),
+            topk_indices_buffer=TritonWarmupTensor(topk_dtype, shape=(1, topk)),
+            has_indexer=compile_key(has_indexer),
+            index_rope_interleave=compile_key(index_rope_interleave),
+            use_pdl=compile_key(use_pdl),
         )
 
-    @kernel_launcher
-    def __call__(
+    def launch_spec(
         self,
         positions: torch.Tensor,
         q_c: torch.Tensor,
@@ -1109,29 +1024,13 @@ def _fused_q_kernel(
         )
 
 
-class FusedQTritonKernel(VllmTritonJitKernel["FusedQTritonKernel.CompileKey"]):
+class FusedQTritonKernel(DeclarativeTritonJitKernel):
     """Warmup owner for the Triton fused MQA/indexer query path."""
 
     kernel = staticmethod(_fused_q_kernel)
     num_warps = 1
 
-    @dataclass(frozen=True)
-    class CompileKey:
-        num_q_heads: int
-        q_pe_half_rot_dim: int
-        num_index_q_heads: int
-        index_q_half_rot_dim: int
-        index_q_head_dim: int
-        ql_nope_dim: int
-        ql_nope_block: int
-        has_indexer: bool
-        index_rope_interleave: bool
-        quantize_mqa: bool
-        use_pdl: bool
-        act_dtype: torch.dtype
-        cos_sin_dtype: torch.dtype
-
-    def dispatch(  # type: ignore[override]
+    def warmup_cases(
         self,
         *,
         num_q_heads: int,
@@ -1142,88 +1041,35 @@ class FusedQTritonKernel(VllmTritonJitKernel["FusedQTritonKernel.CompileKey"]):
         has_indexer: bool,
         index_rope_interleave: bool,
         quantize_mqa: bool,
-        use_pdl: bool,
         act_dtype: torch.dtype,
         cos_sin_dtype: torch.dtype,
-    ) -> "FusedQTritonKernel.CompileKey":
-        half_rot = qk_rope_head_dim // 2
-        return self.CompileKey(
-            num_q_heads=num_q_heads,
-            q_pe_half_rot_dim=half_rot,
-            num_index_q_heads=index_n_head if has_indexer else 1,
-            index_q_half_rot_dim=half_rot,
-            index_q_head_dim=index_head_dim if has_indexer else 1,
-            ql_nope_dim=kv_lora_rank,
-            ql_nope_block=triton.next_power_of_2(kv_lora_rank),
-            has_indexer=has_indexer,
-            index_rope_interleave=index_rope_interleave,
-            quantize_mqa=quantize_mqa,
-            use_pdl=use_pdl,
-            act_dtype=act_dtype,
-            cos_sin_dtype=cos_sin_dtype,
-        )
-
-    def get_warmup_keys(  # type: ignore[override]
-        self,
-        *,
-        num_q_heads: int,
-        qk_rope_head_dim: int,
-        kv_lora_rank: int,
-        index_n_head: int,
-        index_head_dim: int,
-        has_indexer: bool,
-        index_rope_interleave: bool,
-        quantize_mqa: bool,
-        use_pdl: bool,
-        act_dtype: torch.dtype,
-        cos_sin_dtype: torch.dtype,
-    ) -> "list[FusedQTritonKernel.CompileKey]":
-        return self._trace_dispatch(self.dispatch)(
-            num_q_heads=num_q_heads,
-            qk_rope_head_dim=qk_rope_head_dim,
-            kv_lora_rank=kv_lora_rank,
-            index_n_head=index_n_head,
-            index_head_dim=index_head_dim,
-            has_indexer=has_indexer,
-            index_rope_interleave=index_rope_interleave,
-            quantize_mqa=quantize_mqa,
-            use_pdl=use_pdl,
-            act_dtype=act_dtype,
-            cos_sin_dtype=cos_sin_dtype,
-        )
-
-    def warmup_inputs(
-        self, compile_key: "FusedQTritonKernel.CompileKey"
-    ) -> dict[str, Any]:
-        act = compile_key.act_dtype
-        cos_sin = compile_key.cos_sin_dtype
-        mqa_out_dtype = torch.float8_e4m3fn if compile_key.quantize_mqa else act
-        iw_dtype = act if compile_key.has_indexer else torch.float32
-        rope_dim = 2 * compile_key.q_pe_half_rot_dim
+    ) -> dict[str, object]:
+        mqa_out_dtype = torch.float8_e4m3fn if quantize_mqa else act_dtype
+        iw_dtype = act_dtype if has_indexer else torch.float32
+        rope_dim = qk_rope_head_dim
+        num_index_q_heads = index_n_head if has_indexer else 1
         index_shape = (
-            (1, compile_key.num_index_q_heads, compile_key.index_q_head_dim)
-            if compile_key.has_indexer
-            else (1, 1, 1)
+            (1, num_index_q_heads, index_head_dim) if has_indexer else (1, 1, 1)
         )
         return dict(
+            num_q_heads=compile_key(num_q_heads),
+            q_pe_half_rot_dim=compile_key(qk_rope_head_dim // 2),
+            num_index_q_heads=compile_key(num_index_q_heads),
+            index_q_half_rot_dim=compile_key(qk_rope_head_dim // 2),
+            index_q_head_dim=compile_key(index_head_dim if has_indexer else 1),
+            ql_nope_dim=compile_key(kv_lora_rank),
+            ql_nope_block=compile_key(triton.next_power_of_2(kv_lora_rank)),
+            use_pdl=compile_key(current_platform.is_arch_support_pdl()),
+            act_dtype=compile_key(act_dtype),
+            cos_sin_dtype=compile_key(cos_sin_dtype),
             positions=TritonWarmupTensor(torch.int64),
-            q_pe=TritonWarmupTensor(
-                act,
-                shape=(1, compile_key.num_q_heads, rope_dim),
-            ),
-            q_pe_cos_sin_cache=TritonWarmupTensor(
-                cos_sin,
-                shape=(1, rope_dim),
-            ),
-            index_q=TritonWarmupTensor(act, shape=index_shape),
+            q_pe=TritonWarmupTensor(act_dtype, shape=(1, num_q_heads, rope_dim)),
+            q_pe_cos_sin_cache=TritonWarmupTensor(cos_sin_dtype, shape=(1, rope_dim)),
+            index_q=TritonWarmupTensor(act_dtype, shape=index_shape),
             index_q_cos_sin_cache=TritonWarmupTensor(
-                cos_sin,
-                shape=(1, rope_dim),
+                cos_sin_dtype, shape=(1, rope_dim)
             ),
-            ql_nope=TritonWarmupTensor(
-                act,
-                shape=(1, compile_key.num_q_heads, compile_key.ql_nope_dim),
-            ),
+            ql_nope=TritonWarmupTensor(act_dtype, shape=(1, num_q_heads, kv_lora_rank)),
             q_scale=TritonWarmupTensor(torch.float32),
             index_q_fp8=TritonWarmupTensor(
                 torch.float8_e4m3fn,
@@ -1233,31 +1079,26 @@ class FusedQTritonKernel(VllmTritonJitKernel["FusedQTritonKernel.CompileKey"]):
                 mqa_out_dtype,
                 shape=(
                     1,
-                    compile_key.num_q_heads,
-                    compile_key.ql_nope_dim + rope_dim,
+                    num_q_heads,
+                    kv_lora_rank + rope_dim,
                 ),
             ),
             q_pe_out=TritonWarmupTensor(
                 mqa_out_dtype,
-                shape=(1, compile_key.num_q_heads, rope_dim),
+                shape=(1, num_q_heads, rope_dim),
             ),
-            index_weights=TritonWarmupTensor(
-                iw_dtype,
-                shape=(1, compile_key.num_index_q_heads),
-            ),
+            index_weights=TritonWarmupTensor(iw_dtype, shape=(1, num_index_q_heads)),
             index_weights_out=TritonWarmupTensor(
-                torch.float32,
-                shape=(1, compile_key.num_index_q_heads),
+                torch.float32, shape=(1, num_index_q_heads)
             ),
             index_weights_softmax_scale=0.0,
             index_weights_head_scale=0.0,
-            has_indexer=compile_key.has_indexer,
-            index_rope_interleave=compile_key.index_rope_interleave,
-            quantize_mqa=compile_key.quantize_mqa,
+            has_indexer=compile_key(has_indexer),
+            index_rope_interleave=compile_key(index_rope_interleave),
+            quantize_mqa=compile_key(quantize_mqa),
         )
 
-    @kernel_launcher
-    def __call__(
+    def launch_spec(
         self,
         positions: torch.Tensor,
         q_pe: torch.Tensor,
@@ -1390,7 +1231,6 @@ def register_fused_q_warmup(
         has_indexer=has_indexer,
         index_rope_interleave=index_rope_interleave,
         quantize_mqa=quantize_mqa,
-        use_pdl=current_platform.is_arch_support_pdl(),
         act_dtype=act_dtype,
         cos_sin_dtype=rope_cache_dtype,
     )
@@ -1553,77 +1393,45 @@ def _fused_eh_norm_kernel(
     tl.store(out_ptr + tok * out_stride + H + off, p_normed, mask=mask)
 
 
-class FusedEhNormKernel(VllmTritonJitKernel["FusedEhNormKernel.CompileKey"]):
+class FusedEhNormKernel(DeclarativeTritonJitKernel):
     """Warmup owner for the MTP embed/hidden RMSNorm fusion."""
+
     kernel = staticmethod(_fused_eh_norm_kernel)
 
-    @dataclass(frozen=True)
-    class CompileKey:
-        hidden_size: int
-        block_size: int
-        dtype: torch.dtype
-
-    def dispatch(
-        self,
-        *,
-        h: int,
-        dtype: torch.dtype,
-    ) -> CompileKey:  # type: ignore[override]
-        return self.CompileKey(
-            hidden_size=h,
-            block_size=triton.next_power_of_2(h),
-            dtype=dtype,
-        )
-
-    def get_warmup_keys(self, vllm_config: Any) -> list[CompileKey]:
+    def warmup_cases(self, vllm_config: Any) -> dict[str, object]:
         speculative_config = vllm_config.speculative_config
         assert speculative_config is not None
         draft_model_config = speculative_config.draft_model_config
-        return self._trace_dispatch(self.dispatch)(
-            h=draft_model_config.hf_config.hidden_size,
-            dtype=draft_model_config.dtype,
-        )
-
-    def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
-        hidden = TritonWarmupTensor(
-            compile_key.dtype,
-            shape=(1, compile_key.hidden_size),
-        )
+        h = draft_model_config.hf_config.hidden_size
+        dtype = draft_model_config.dtype
+        hidden = TritonWarmupTensor(dtype, shape=(1, h))
         return dict(
-            positions=TritonWarmupTensor(torch.int64),
-            inputs_embeds=hidden,
-            previous_hidden=hidden,
+            hidden_size=compile_key(h),
+            block_size=compile_key(triton.next_power_of_2(h)),
+            dtype=compile_key(dtype),
+            pos=TritonWarmupTensor(torch.int64),
+            embeds=hidden,
+            prev=hidden,
             enorm_w=hidden,
             hnorm_w=hidden,
             eps=0.0,
-            out=TritonWarmupTensor(
-                compile_key.dtype,
-                shape=(1, 2 * compile_key.hidden_size),
-            ),
+            out=TritonWarmupTensor(dtype, shape=(1, 2 * h)),
         )
 
-    @kernel_launcher
-    def __call__(
+    def launch_spec(
         self,
-        positions: torch.Tensor,
-        inputs_embeds: torch.Tensor,
-        previous_hidden: torch.Tensor,
+        pos: torch.Tensor,
+        embeds: torch.Tensor,
+        prev: torch.Tensor,
         enorm_w: torch.Tensor,
         hnorm_w: torch.Tensor,
         eps: float,
         out: torch.Tensor,
     ) -> LaunchSpec:
-        n, h = inputs_embeds.shape
+        n, h = embeds.shape
         return (n,), dict(
-            pos_ptr=positions,
-            embeds_ptr=inputs_embeds,
-            embeds_stride=inputs_embeds.stride(0),
-            prev_ptr=previous_hidden,
-            prev_stride=previous_hidden.stride(0),
-            enorm_w_ptr=enorm_w,
-            hnorm_w_ptr=hnorm_w,
-            eps=eps,
-            out_ptr=out,
+            embeds_stride=embeds.stride(0),
+            prev_stride=prev.stride(0),
             out_stride=out.stride(0),
             H=h,
             BLOCK=triton.next_power_of_2(h),

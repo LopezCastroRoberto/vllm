@@ -1,16 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
-from typing import Any
-
 import torch
 
-from vllm.model_executor.warmup.jit_warmup import kernel_launcher
+from vllm.model_executor.warmup.jit_warmup import WarmupChoices
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    DeclarativeTritonJitKernel,
     LaunchSpec,
     TritonWarmupTensor,
-    VllmTritonJitKernel,
+    compile_key,
     triton_scalar_specialization_rep,
 )
 from vllm.platforms import current_platform
@@ -52,103 +50,46 @@ def _gather_initial_states_kernel(
     tl.store(output_ptr + batch_idx * row_size + offsets, values, mask=mask)
 
 
-class GatherInitialStatesKernel(
-    VllmTritonJitKernel["GatherInitialStatesKernel.CompileKey"]
-):
+class GatherInitialStatesKernel(DeclarativeTritonJitKernel):
     kernel = staticmethod(_gather_initial_states_kernel)
     max_block_size = 1024
     num_warps = 8
 
-    @dataclass(frozen=True)
-    class CompileKey:
-        row_size: int
-        state_stride: int
-        indices_stride: int
-        has_initial_state_stride: int
-        block_size: int
-        launch_pdl: bool
-        state_dtype: torch.dtype
-        indices_dtype: torch.dtype
-        indices_aligned: bool
-        has_initial_state_aligned: bool
-
-    def dispatch(
-        self,
-        *,
-        row_size: int,
-        state_stride: int,
-        indices_stride: int,
-        has_initial_state_stride: int,
-        block_size: int,
-        launch_pdl: bool,
-        state_dtype: torch.dtype,
-        indices_dtype: torch.dtype,
-        indices_aligned: bool,
-        has_initial_state_aligned: bool,
-    ) -> CompileKey:
-        return self.CompileKey(
-            row_size=row_size,
-            state_stride=triton_scalar_specialization_rep(state_stride),
-            indices_stride=triton_scalar_specialization_rep(indices_stride),
-            has_initial_state_stride=triton_scalar_specialization_rep(
-                has_initial_state_stride
-            ),
-            block_size=block_size,
-            launch_pdl=launch_pdl,
-            state_dtype=state_dtype,
-            indices_dtype=indices_dtype,
-            indices_aligned=indices_aligned,
-            has_initial_state_aligned=has_initial_state_aligned,
-        )
-
-    def get_warmup_keys(
+    def warmup_cases(
         self,
         *,
         row_size: int,
         state_dtype: torch.dtype,
         indices_dtype: torch.dtype,
         launch_pdl: bool,
-    ) -> list[CompileKey]:
-        return self._trace_dispatch(self.dispatch)(
-            row_size=row_size,
-            state_stride=row_size,
-            indices_stride=1,
-            has_initial_state_stride=1,
-            block_size=min(triton.next_power_of_2(row_size), self.max_block_size),
-            launch_pdl=launch_pdl,
-            state_dtype=state_dtype,
-            indices_dtype=indices_dtype,
-            indices_aligned=(True, False),
-            has_initial_state_aligned=(True, False),
-        )
-
-    def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
+    ) -> tuple[dict[str, object], ...]:
+        state_stride = triton_scalar_specialization_rep(row_size)
+        block_size = min(triton.next_power_of_2(row_size), self.max_block_size)
+        indices_aligned = WarmupChoices(True, False)
+        has_initial_state_aligned = WarmupChoices(True, False)
         return dict(
+            state_stride=compile_key(state_stride),
+            indices_stride=compile_key(1),
+            has_initial_state_stride=compile_key(1),
+            state_dtype=compile_key(state_dtype),
+            indices_dtype=compile_key(indices_dtype),
+            indices_aligned=compile_key(indices_aligned),
+            has_initial_state_aligned=compile_key(has_initial_state_aligned),
             state=TritonWarmupTensor(
-                compile_key.state_dtype,
-                shape=(1, compile_key.row_size),
-                strides=(compile_key.state_stride, 1),
+                state_dtype, shape=(1, row_size), strides=(state_stride, 1)
             ),
-            indices=TritonWarmupTensor(
-                compile_key.indices_dtype,
-                aligned=compile_key.indices_aligned,
-            ),
+            indices=TritonWarmupTensor(indices_dtype, aligned=indices_aligned),
             has_initial_state=TritonWarmupTensor(
-                torch.bool,
-                aligned=compile_key.has_initial_state_aligned,
+                torch.bool, aligned=has_initial_state_aligned
             ),
-            output=TritonWarmupTensor(
-                compile_key.state_dtype,
-                shape=(1, compile_key.row_size),
-            ),
+            output=TritonWarmupTensor(state_dtype, shape=(1, row_size)),
             num_indices=1,
-            row_size=compile_key.row_size,
-            block_size=compile_key.block_size,
-            launch_pdl=compile_key.launch_pdl,
+            row_size=compile_key(row_size),
+            block_size=compile_key(block_size),
+            launch_pdl=compile_key(launch_pdl),
         )
 
-    @kernel_launcher
-    def __call__(
+    def launch_spec(
         self,
         state: torch.Tensor,
         indices: torch.Tensor,
@@ -161,10 +102,6 @@ class GatherInitialStatesKernel(
     ) -> LaunchSpec:
         grid = (triton.cdiv(row_size, block_size), num_indices)
         return grid, dict(
-            state_ptr=state,
-            indices_ptr=indices,
-            has_initial_state_ptr=has_initial_state,
-            output_ptr=output,
             stride_state_batch=state.stride(0),
             stride_indices=indices.stride(0),
             stride_has_initial_state=has_initial_state.stride(0),

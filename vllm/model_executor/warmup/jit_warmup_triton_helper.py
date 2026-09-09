@@ -3,8 +3,8 @@
 import ast
 import inspect
 from abc import abstractmethod
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Hashable, Mapping, Sequence
+from dataclasses import dataclass, field
 from functools import cached_property, wraps
 from typing import Any, ClassVar, Generic, TypeVar, cast
 
@@ -15,7 +15,11 @@ from vllm.model_executor.warmup.jit_warmup import (
 )
 
 CompileKeyT = TypeVar("CompileKeyT")
-LaunchSpec = tuple[tuple[int, ...], dict[str, Any]]
+InputT = TypeVar("InputT")
+LaunchSpec = (
+    tuple[tuple[int, ...], dict[str, Any]]
+    | tuple[tuple[int, ...], dict[str, Any], Any]
+)
 
 
 def triton_scalar_specialization_rep(value: int) -> int:
@@ -119,11 +123,11 @@ class VllmTritonJitKernel(VllmJitKernel[CompileKeyT], Generic[CompileKeyT]):
 
     def launch(
         self,
-        grid: tuple[int, ...],
+        launch_spec: LaunchSpec,
         inputs: Mapping[str, Any],
-        /,
-        **kwargs: Any,
     ) -> Any:
+        grid, launch_kwargs = launch_spec[:2]
+        kwargs = dict(launch_kwargs)
         runtime_launcher = kwargs.pop("_runtime_launcher", None)
         runtime_launcher_arg_count = kwargs.pop("_runtime_launcher_arg_count", 0)
         for name, value in inputs.items():
@@ -161,9 +165,171 @@ def kernel_launcher(
         inputs = {
             name: value for name, value in bound.arguments.items() if name != "self"
         }
-        self.launch(grid, inputs, **launch_kwargs)
+        self.launch((grid, launch_kwargs), inputs)
 
     return wrapper
+
+
+@dataclass(frozen=True)
+class TritonWarmupInputs:
+    """One immutable set of inputs for a compile-only Triton launch."""
+
+    values: tuple[tuple[str, Any], ...]
+
+    @classmethod
+    def from_mapping(cls, inputs: Mapping[str, Any]) -> "TritonWarmupInputs":
+        values = tuple(sorted(inputs.items()))
+        try:
+            hash(values)
+        except TypeError as exc:
+            raise TypeError(
+                "Declarative Triton warmup inputs must be immutable and hashable"
+            ) from exc
+        return cls(values)
+
+    def as_dict(self) -> dict[str, Any]:
+        return dict(self.values)
+
+
+@dataclass(frozen=True)
+class CompileKeyValue(Generic[InputT]):
+    value: InputT
+
+
+def compile_key(value: InputT) -> InputT:
+    """Mark this named warmup-case field as a compile-key field."""
+    try:
+        hash(value)
+    except TypeError as exc:
+        raise TypeError("Declarative compile-key values must be hashable") from exc
+    return cast(InputT, CompileKeyValue(value=value))
+
+
+WarmupCases = Mapping[str, Any] | Sequence[Mapping[str, Any]]
+
+
+class DeclarativeTritonJitKernel(
+    VllmTritonJitKernel["DeclarativeTritonJitKernel.CompileKey"]
+):
+    """Structured owner for Triton kernels with finite synthetic launch cases.
+
+    Subclasses retain the normal owner class, raw ``kernel``, and independent
+    runtime ``__call__``. They only provide ``warmup_cases``; this base owns the
+    mechanical compile key, key expansion, deduplication, and input replay.
+    """
+
+    @dataclass(frozen=True, init=False)
+    class CompileKey:
+        values: tuple[tuple[str, Hashable], ...]
+        inputs: TritonWarmupInputs = field(compare=False, hash=False, repr=False)
+
+        def __init__(
+            self,
+            inputs: TritonWarmupInputs | None = None,
+            **kwargs: Any,
+        ) -> None:
+            if inputs is not None and kwargs:
+                raise TypeError("Pass either inputs or named warmup inputs, not both")
+            case = inputs.as_dict() if inputs is not None else kwargs
+            unwrapped: dict[str, Any] = {}
+            marked: dict[str, Hashable] = {}
+            for name, value in case.items():
+                if isinstance(value, CompileKeyValue):
+                    unwrapped[name] = value.value
+                    marked[name] = cast(Hashable, value.value)
+                else:
+                    unwrapped[name] = value
+            if not marked:
+                raise ValueError(
+                    "Declarative warmup cases must mark their compile-key fields"
+                )
+            inputs = TritonWarmupInputs.from_mapping(unwrapped)
+            values = tuple(sorted(marked.items()))
+            object.__setattr__(self, "values", values)
+            object.__setattr__(self, "inputs", inputs)
+
+    def dispatch(
+        self,
+        *,
+        inputs: TritonWarmupInputs,
+    ) -> CompileKey:
+        return self.CompileKey(inputs=inputs)
+
+    def launch_spec(self, **kwargs: Any) -> LaunchSpec:
+        """Return the grid and derived launch metadata for an inherited call."""
+        raise NotImplementedError
+
+    @cached_property
+    def _launch_spec_arg_names(self) -> tuple[str, ...]:
+        return tuple(inspect.signature(self.launch_spec).parameters)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Bind raw kernel inputs and invoke ``launch_spec`` when inherited."""
+        call_arg_names = self._launch_spec_arg_names
+        if len(args) > len(call_arg_names):
+            raise TypeError(
+                f"Expected at most {len(call_arg_names)} positional "
+                f"arguments, got {len(args)}"
+            )
+        inputs = dict(zip(call_arg_names, args, strict=False))
+        duplicate = inputs.keys() & kwargs.keys()
+        if duplicate:
+            name = next(iter(duplicate))
+            raise TypeError(f"Got multiple values for argument '{name}'")
+        inputs.update(kwargs)
+        try:
+            launch_inputs = {name: inputs[name] for name in call_arg_names}
+        except KeyError as exc:
+            raise TypeError(
+                f"Missing launch-spec argument '{exc.args[0]}'"
+            ) from None
+        launch_spec = self.launch_spec(**launch_inputs)
+        grid, launch_kwargs = launch_spec[:2]
+        launch_result = self.launch((grid, launch_kwargs), inputs)
+        return launch_spec[2] if len(launch_spec) == 3 else launch_result
+
+    @abstractmethod
+    def warmup_cases(self, *args: Any, **kwargs: Any) -> WarmupCases:
+        """Return complete, runtime-shaped inputs for each specialization."""
+        raise NotImplementedError
+
+    def get_warmup_keys(self, *args: Any, **kwargs: Any) -> list[CompileKey]:
+        cases_node = get_function_source_node(self.warmup_cases)
+        if any(
+            isinstance(node, ast.Call)
+            and get_ast_full_name(node.func).split(".")[-1]
+            in {"WarmupIntRange", "WarmupChoices", "_when"}
+            for node in ast.walk(cases_node)
+        ):
+            return self._trace_warmup_cases(
+                self.warmup_cases, *args, **kwargs
+            )
+        cases = self.warmup_cases(*args, **kwargs)
+        if isinstance(cases, Sequence) and all(
+            isinstance(case, self.CompileKey) for case in cases
+        ):
+            return list(cases)
+        if isinstance(cases, Mapping):
+            cases = (cases,)
+        return self._trace_dispatch(self.dispatch)(
+            inputs=tuple(TritonWarmupInputs.from_mapping(case) for case in cases)
+        )
+
+    def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
+        call_signature = inspect.signature(self)
+        if any(
+            parameter.kind
+            in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+            for parameter in call_signature.parameters.values()
+        ):
+            launch_input_names = set(self._launch_spec_arg_names)
+        else:
+            launch_input_names = set(call_signature.parameters)
+        return {
+            name: value
+            for name, value in compile_key.inputs.values
+            if name in launch_input_names
+        }
 
 
 @dataclass(frozen=True)

@@ -9,15 +9,13 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
-from dataclasses import dataclass
-from typing import Any
-
 import torch
+from vllm.model_executor.warmup.jit_warmup import WarmupChoices
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    DeclarativeTritonJitKernel,
     LaunchSpec,
     TritonWarmupTensor,
-    VllmTritonJitKernel,
-    kernel_launcher,
+    compile_key,
 )
 from vllm.third_party.flash_linear_attention.ops.op import exp
 from vllm.triton_utils import tl, triton
@@ -207,46 +205,10 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         p_beta += HV * (V if IS_BETA_HEADWISE else 1)
 
 
-class Glm5NextFusedRecurrentKdaFwdKernel(
-    VllmTritonJitKernel["Glm5NextFusedRecurrentKdaFwdKernel.CompileKey"]
-):
+class Glm5NextFusedRecurrentKdaFwdKernel(DeclarativeTritonJitKernel):
     kernel = staticmethod(fused_recurrent_gated_delta_rule_fwd_kernel)
 
-    @dataclass(frozen=True)
-    class CompileKey:
-        io_dtype: torch.dtype
-        state_dtype: torch.dtype
-        scale: float
-        num_heads: int
-        head_dim: int
-        stride_indices_seq: int
-        is_spec_decoding: bool
-        lower_bound: float
-
-    def dispatch(
-        self,
-        *,
-        io_dtype: torch.dtype,
-        state_dtype: torch.dtype,
-        scale: float,
-        num_heads: int,
-        head_dim: int,
-        max_query_len: int,
-        is_spec_decoding: bool,
-        lower_bound: float,
-    ) -> CompileKey:
-        return self.CompileKey(
-            io_dtype=io_dtype,
-            state_dtype=state_dtype,
-            scale=scale,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            stride_indices_seq=max_query_len if is_spec_decoding else 1,
-            is_spec_decoding=is_spec_decoding,
-            lower_bound=lower_bound,
-        )
-
-    def get_warmup_keys(
+    def warmup_cases(
         self,
         *,
         io_dtype: torch.dtype,
@@ -256,53 +218,47 @@ class Glm5NextFusedRecurrentKdaFwdKernel(
         head_dim: int,
         max_query_len: int,
         lower_bound: float,
-    ) -> list[CompileKey]:
-        return self._trace_dispatch(self.dispatch)(
-            io_dtype=io_dtype,
-            state_dtype=state_dtype,
-            scale=scale,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            max_query_len=max_query_len,
-            is_spec_decoding=(False, True),
-            lower_bound=lower_bound,
+    ) -> tuple[dict[str, object], ...]:
+        is_spec_decoding = WarmupChoices(False, True)
+        t = max_query_len if is_spec_decoding else 1
+        return dict(
+            io_dtype=compile_key(io_dtype),
+            state_dtype=compile_key(state_dtype),
+            num_heads=compile_key(num_heads),
+            head_dim=compile_key(head_dim),
+            stride_indices_seq=compile_key(max_query_len if is_spec_decoding else 1),
+            is_spec_decoding=compile_key(is_spec_decoding),
+            q=TritonWarmupTensor(io_dtype, shape=(1, t, num_heads, head_dim)),
+            k=TritonWarmupTensor(io_dtype, shape=(1, t, num_heads, head_dim)),
+            v=TritonWarmupTensor(io_dtype, shape=(1, t, num_heads, head_dim)),
+            g=TritonWarmupTensor(io_dtype, shape=(1, t, num_heads, head_dim)),
+            beta=TritonWarmupTensor(io_dtype, shape=(1, t, num_heads)),
+            o=TritonWarmupTensor(io_dtype, shape=(1, t, num_heads, head_dim)),
+            h0=TritonWarmupTensor(
+                state_dtype, shape=(2, num_heads, head_dim, head_dim)
+            ),
+            ht=TritonWarmupTensor(
+                state_dtype, shape=(2, num_heads, head_dim, head_dim)
+            ),
+            cu_seqlens=TritonWarmupTensor(torch.int32, shape=(2,)),
+            ssm_state_indices=TritonWarmupTensor(
+                torch.int32, shape=(1, t) if is_spec_decoding else (1,)
+            ),
+            num_accepted_tokens=TritonWarmupTensor(torch.int32, shape=(1,))
+            if is_spec_decoding
+            else None,
+            a_log=TritonWarmupTensor(torch.float32, shape=(num_heads,)),
+            g_bias=TritonWarmupTensor(torch.float32, shape=(num_heads * head_dim,)),
+            scale=compile_key(scale),
+            inplace_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            is_kda=True,
+            sigmoid_beta=True,
+            compute_gate=True,
+            lower_bound=compile_key(lower_bound),
         )
 
-    def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
-        h, d = compile_key.num_heads, compile_key.head_dim
-        t = compile_key.stride_indices_seq
-        io = compile_key.io_dtype
-        spec = compile_key.is_spec_decoding
-        return {
-            "q": TritonWarmupTensor(io, shape=(1, t, h, d)),
-            "k": TritonWarmupTensor(io, shape=(1, t, h, d)),
-            "v": TritonWarmupTensor(io, shape=(1, t, h, d)),
-            "g": TritonWarmupTensor(io, shape=(1, t, h, d)),
-            "beta": TritonWarmupTensor(io, shape=(1, t, h)),
-            "o": TritonWarmupTensor(io, shape=(1, t, h, d)),
-            "h0": TritonWarmupTensor(compile_key.state_dtype, shape=(2, h, d, d)),
-            "ht": TritonWarmupTensor(compile_key.state_dtype, shape=(2, h, d, d)),
-            "cu_seqlens": TritonWarmupTensor(torch.int32, shape=(2,)),
-            "ssm_state_indices": TritonWarmupTensor(
-                torch.int32,
-                shape=(1, t) if spec else (1,),
-            ),
-            "num_accepted_tokens": (
-                TritonWarmupTensor(torch.int32, shape=(1,)) if spec else None
-            ),
-            "a_log": TritonWarmupTensor(torch.float32, shape=(h,)),
-            "g_bias": TritonWarmupTensor(torch.float32, shape=(h * d,)),
-            "scale": compile_key.scale,
-            "inplace_final_state": True,
-            "use_qk_l2norm_in_kernel": True,
-            "is_kda": True,
-            "sigmoid_beta": True,
-            "compute_gate": True,
-            "lower_bound": compile_key.lower_bound,
-        }
-
-    @kernel_launcher
-    def __call__(
+    def launch_spec(
         self,
         q,
         k,
