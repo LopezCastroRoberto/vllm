@@ -121,7 +121,6 @@ def _warp_splitk_rows(
 # per-call timings on one VRNVL72 GPU (CUDA graph replay, cold L2, PDL where
 # supported); M without a row uses cuBLAS. Warp split-K reduces in-kernel, so no
 # split-K reduce kernel follows it.
-# q_a + kv_a, replicated.
 _SM107_QKV_A_PROJECTION = GLM52ProjectionSpec(
     n=2624,
     k=6144,
@@ -140,7 +139,6 @@ _SM107_QKV_A_PROJECTION = GLM52ProjectionSpec(
     ),
 )
 
-# MTP eh_proj.
 _SM107_EH_PROJECTION = GLM52ProjectionSpec(
     n=6144,
     k=12288,
@@ -155,7 +153,6 @@ _SM107_EH_PROJECTION = GLM52ProjectionSpec(
     ),
 )
 
-# q_b_proj at TP4 and the indexer wq_b (replicated).
 _SM107_Q_B_TP4_PROJECTION = GLM52ProjectionSpec(
     n=4096,
     k=2048,
@@ -172,7 +169,6 @@ _SM107_Q_B_TP4_PROJECTION = GLM52ProjectionSpec(
     ),
 )
 
-# o_proj at TP4.
 _SM107_O_PROJ_TP4_PROJECTION = GLM52ProjectionSpec(
     n=6144,
     k=4096,
@@ -189,7 +185,6 @@ _SM107_O_PROJ_TP4_PROJECTION = GLM52ProjectionSpec(
     ),
 )
 
-# indexer wk + weights_proj, replicated.
 _SM107_WK_WEIGHTS_PROJECTION = GLM52ProjectionSpec(
     n=160,
     k=6144,
@@ -207,7 +202,6 @@ _SM107_WK_WEIGHTS_PROJECTION = GLM52ProjectionSpec(
     ),
 )
 
-# shared expert gate_up at TP4.
 _SM107_SHARED_GATE_UP_TP4_PROJECTION = GLM52ProjectionSpec(
     n=1024,
     k=6144,
@@ -226,7 +220,6 @@ _SM107_SHARED_GATE_UP_TP4_PROJECTION = GLM52ProjectionSpec(
     ),
 )
 
-# shared expert down at TP4.
 _SM107_SHARED_DOWN_TP4_PROJECTION = GLM52ProjectionSpec(
     n=6144,
     k=512,
@@ -234,7 +227,6 @@ _SM107_SHARED_DOWN_TP4_PROJECTION = GLM52ProjectionSpec(
     warp_splitk_configs=_warp_splitk_rows({24: (32, 8, 128, 4, 2)}, first_m=2),
 )
 
-# q_b_proj at TP8: the SM103 entry, re-measured on VRNVL72 and kept.
 _SM107_Q_B_TP8_PROJECTION = GLM52_Q_B_PROJECTION
 
 GLM52_PROJECTIONS_SM107 = {
