@@ -86,13 +86,48 @@ __device__ __forceinline__ uint32_t extract_coarse_bin(float x) {
   return hist4096::extract_coarse_bin_N<kHistBits>(x);
 }
 
+// Coarse bins of two FP32 scores from one packed FP16 conversion; equal to
+// extract_coarse_bin_N of each (same round-to-nearest conversion).
+template <uint32_t kBits>
+__device__ __forceinline__ uint2 extract_coarse_bins_f32x2(float a, float b) {
+  const __half2 h = __floats2half2_rn(a, b);
+  const uint32_t bits = *reinterpret_cast<const uint32_t*>(&h);
+  const uint32_t sign = bits & 0x80008000u;
+  const uint32_t key = bits ^ ((sign - (sign >> 15)) | 0x80008000u);
+  return make_uint2((key & 0xFFFFu) >> (16 - kBits), key >> (32 - kBits));
+}
+
 // Visit a staged chunk's scores as (index in chunk, coarse bin, score). BF16
-// is read two scores per 32-bit load.
+// is read two scores per 32-bit load. A full FP32 stage takes a branch-free
+// path: four 16-byte loads per thread, bins from packed FP16 conversions, so
+// the per-score work of a thread is independent and overlaps.
 template <uint32_t kBits, typename InT, typename Visit>
 __device__ __forceinline__ void for_each_staged_score(const InT* buf,
                                                       uint32_t sz,
                                                       Visit visit) {
   const auto tx = threadIdx.x;
+  if constexpr (std::is_same_v<InT, float>) {
+    if (sz == kSizePerStage) {
+      constexpr uint32_t kVecs = kElemPerStage / 4;
+      const auto* b4 = reinterpret_cast<const float4*>(buf);
+      float4 v[kVecs];
+#pragma unroll
+      for (uint32_t j = 0; j < kVecs; j++) {
+        v[j] = b4[tx + j * hist4096::kBlockSize];
+      }
+#pragma unroll
+      for (uint32_t j = 0; j < kVecs; j++) {
+        const uint2 b01 = extract_coarse_bins_f32x2<kBits>(v[j].x, v[j].y);
+        const uint2 b23 = extract_coarse_bins_f32x2<kBits>(v[j].z, v[j].w);
+        const uint32_t li = 4 * (tx + j * hist4096::kBlockSize);
+        visit(li, b01.x, v[j].x);
+        visit(li + 1, b01.y, v[j].y);
+        visit(li + 2, b23.x, v[j].z);
+        visit(li + 3, b23.y, v[j].w);
+      }
+      return;
+    }
+  }
   if constexpr (std::is_same_v<InT, __nv_bfloat16>) {
     const auto* words = reinterpret_cast<const uint32_t*>(buf);
 #pragma unroll
@@ -362,29 +397,10 @@ __device__ void large_topk(const InT* __restrict__ row_input,
       }
       phases[iter]++;
       __syncwarp();
-      if constexpr (std::is_same_v<InT, __nv_bfloat16>) {
-        for_each_staged_score<kHistBits>(smem->score_buffer[iter], sz,
-                                         [&](uint32_t, uint32_t bin, float) {
-                                           atomicAdd(&smem->histogram[bin], 1);
-                                         });
-      } else {
-#pragma unroll
-        for (uint32_t i = 0; i < kElemPerStage; i += 2) {
-          const auto li0 = tx + i * hist4096::kBlockSize;
-          const auto li1 = tx + (i + 1) * hist4096::kBlockSize;
-          if (li0 >= sz) {
-            break;
-          }
-          const auto b0 = extract_coarse_bin(smem->score_buffer[iter][li0]);
-          if (li1 < sz) {
-            const auto b1 = extract_coarse_bin(smem->score_buffer[iter][li1]);
-            atomicAdd(&smem->histogram[b0], 1);
-            atomicAdd(&smem->histogram[b1], 1);
-          } else {
-            atomicAdd(&smem->histogram[b0], 1);
-          }
-        }
-      }
+      for_each_staged_score<kHistBits>(smem->score_buffer[iter], sz,
+                                       [&](uint32_t, uint32_t bin, float) {
+                                         atomicAdd(&smem->histogram[bin], 1);
+                                       });
     }
   } else {
     // Twopass: init then stream histogram pass
